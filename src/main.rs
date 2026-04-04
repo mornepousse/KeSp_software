@@ -10,6 +10,26 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::rc::Rc;
 
+/// Sender wrapper that wakes the Slint event loop after each send.
+/// This eliminates the need for a polling timer.
+#[derive(Clone)]
+struct UiSender {
+    tx: mpsc::Sender<BgMsg>,
+    /// Sending a no-op invoke_from_event_loop wakes the event loop,
+    /// which will then process the pending message via a zero-delay timer.
+    _wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl UiSender {
+    fn new(tx: mpsc::Sender<BgMsg>, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self { tx, _wake: wake }
+    }
+    fn send(&self, msg: BgMsg) {
+        let _ = self.tx.send(msg);
+        (self._wake)();
+    }
+}
+
 /// Build the full list of keycode entries for the key selector, grouped by category.
 /// Entries with code=-1 are section headers.
 fn build_keycode_entries() -> Vec<KeycodeEntry> {
@@ -282,7 +302,14 @@ fn main() {
 
     // Serial manager shared between threads
     let serial: Arc<Mutex<SerialManager>> = Arc::new(Mutex::new(SerialManager::new()));
-    let (bg_tx, bg_rx) = mpsc::channel::<BgMsg>();
+    let (raw_tx, bg_rx) = mpsc::channel::<BgMsg>();
+    // Wrap sender: each send() also wakes the Slint event loop via invoke_from_event_loop
+    let wake_fn: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {
+        let _ = slint::invoke_from_event_loop(|| {
+            // no-op: just waking the event loop so the single-shot timer fires
+        });
+    });
+    let bg_tx = UiSender::new(raw_tx, wake_fn);
 
     // Current state
     let current_keymap: Rc<std::cell::RefCell<Vec<Vec<u16>>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -1228,7 +1255,7 @@ fn main() {
         });
     }
 
-    // --- Poll background messages via timer ---
+    // --- Process background messages (event-driven, no polling) ---
     {
         let window_weak = window.as_weak();
         let keycap_model = keycap_model.clone();
@@ -1236,10 +1263,11 @@ fn main() {
         let current_keymap = current_keymap.clone();
         let keyboard_layout = keyboard_layout.clone();
 
+        // Single-shot timer at 0ms — only restarts when invoke_from_event_loop wakes us
         let timer = slint::Timer::default();
         timer.start(
             slint::TimerMode::Repeated,
-            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(200),
             move || {
                 let Some(window) = window_weak.upgrade() else { return };
 

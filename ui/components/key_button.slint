@@ -8,13 +8,21 @@ export component KeyButton inherits Rectangle {
     width: data.w;
     height: data.h;
     border-radius: 4px;
-    background: data.selected ? Theme.accent-purple : data.color;
+    background: data.color;
     border-width: 1px;
-    border-color: data.selected ? Theme.accent-cyan : Theme.bg-primary;
+    border-color: #282a36;
+
+    // Selection overlay (conditional, no ternary on parent properties)
+    if data.selected : Rectangle {
+        background: #bd93f980;
+        border-width: 2px;
+        border-color: #8be9fd;
+        border-radius: 4px;
+    }
 
     Text {
         text: data.label;
-        color: Theme.fg-primary;
+        color: #f8f8f2;
         font-size: 11px;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -23,15 +31,13 @@ export component KeyButton inherits Rectangle {
     if data.sublabel != "" : Text {
         y: parent.height - 14px;
         text: data.sublabel;
-        color: Theme.fg-secondary;
+        color: #6272a4;
         font-size: 8px;
         horizontal-alignment: center;
         width: 100%;
     }
 
-    touch := TouchArea {
+    TouchArea {
         clicked => { root.clicked(data.index); }
-        mouse-cursor: pointer;
     }
-
 }
