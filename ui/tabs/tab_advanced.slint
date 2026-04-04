@@ -1,11 +1,302 @@
+import { Button, ScrollView } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
+import { AppState, ConnectionState, AdvancedBridge } from "../globals.slint";
+
+component SectionHeader inherits Rectangle {
+    in property <string> title;
+    in-out property <bool> expanded;
+    height: 36px;
+    background: Theme.bg-secondary;
+    border-radius: 4px;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        alignment: start;
+        Text {
+            text: (expanded ? "▼ " : "▶ ") + title;
+            color: Theme.accent-purple;
+            font-size: 14px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+    TouchArea { clicked => { expanded = !expanded; } }
+}
+
+component TdActionBox inherits Rectangle {
+    in property <string> action-label;
+    in property <string> key-label;
+    width: 80px;
+    height: 36px;
+    border-radius: 3px;
+    background: Theme.button-bg;
+
+    VerticalLayout {
+        alignment: center;
+        padding: 2px;
+        Text {
+            text: action-label;
+            color: Theme.fg-secondary;
+            font-size: 8px;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: key-label;
+            color: Theme.fg-primary;
+            font-size: 10px;
+            horizontal-alignment: center;
+            overflow: elide;
+        }
+    }
+}
 
 export component TabAdvanced inherits Rectangle {
     background: Theme.bg-primary;
-    Text {
-        text: "Advanced (coming soon)";
-        color: Theme.fg-secondary;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+
+    if AppState.connection != ConnectionState.connected : VerticalLayout {
+        alignment: center;
+        Text {
+            text: "Connect to a keyboard first";
+            color: Theme.fg-secondary;
+            font-size: 14px;
+            horizontal-alignment: center;
+        }
+    }
+
+    if AppState.connection == ConnectionState.connected : ScrollView {
+        VerticalLayout {
+            padding: 12px;
+            spacing: 8px;
+
+            // Refresh All button
+            HorizontalLayout {
+                alignment: start;
+                Button {
+                    text: "Refresh All";
+                    clicked => { AdvancedBridge.refresh-all(); }
+                }
+            }
+
+            // ---- TAP DANCE ----
+            SectionHeader { title: "Tap Dance"; expanded <=> AdvancedBridge.show-tap-dance; }
+
+            if AdvancedBridge.show-tap-dance : VerticalLayout {
+                spacing: 4px;
+                padding-left: 8px;
+                padding-right: 8px;
+
+                Text {
+                    text: "One key, 4 behaviors: single tap, double tap, triple tap, hold.";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                for td in AdvancedBridge.tap-dance-slots : Rectangle {
+                    height: 48px;
+                    background: Theme.bg-surface;
+                    border-radius: 4px;
+
+                    HorizontalLayout {
+                        padding: 8px;
+                        spacing: 6px;
+
+                        Text {
+                            text: "TD " + td.index;
+                            color: Theme.accent-purple;
+                            font-weight: 700;
+                            width: 40px;
+                            vertical-alignment: center;
+                        }
+
+                        TdActionBox { action-label: "1-tap"; key-label: td.tap1; }
+                        TdActionBox { action-label: "2-tap"; key-label: td.tap2; }
+                        TdActionBox { action-label: "3-tap"; key-label: td.tap3; }
+                        TdActionBox { action-label: "hold"; key-label: td.hold; }
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Save";
+                                clicked => { AdvancedBridge.save-td(td.index); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- COMBOS ----
+            SectionHeader { title: "Combos"; expanded <=> AdvancedBridge.show-combos; }
+
+            if AdvancedBridge.show-combos : VerticalLayout {
+                spacing: 4px;
+                padding-left: 8px;
+                padding-right: 8px;
+
+                Text {
+                    text: "Press two keys simultaneously to produce a different key.";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                for combo in AdvancedBridge.combos : Rectangle {
+                    height: 44px;
+                    background: Theme.bg-surface;
+                    border-radius: 4px;
+
+                    HorizontalLayout {
+                        padding: 8px;
+                        spacing: 6px;
+
+                        Text {
+                            text: "#" + combo.index;
+                            color: Theme.accent-cyan;
+                            font-weight: 700;
+                            width: 32px;
+                            vertical-alignment: center;
+                        }
+
+                        // Key 1
+                        Rectangle {
+                            width: 70px;
+                            height: 30px;
+                            border-radius: 3px;
+                            background: Theme.button-bg;
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: combo.key1-label;
+                                    color: Theme.fg-primary;
+                                    font-size: 11px;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "+";
+                            color: Theme.fg-secondary;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+
+                        // Key 2
+                        Rectangle {
+                            width: 70px;
+                            height: 30px;
+                            border-radius: 3px;
+                            background: Theme.button-bg;
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: combo.key2-label;
+                                    color: Theme.fg-primary;
+                                    font-size: 11px;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "=";
+                            color: Theme.fg-secondary;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+
+                        // Result
+                        Rectangle {
+                            width: 70px;
+                            height: 30px;
+                            border-radius: 3px;
+                            background: Theme.accent-purple;
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: combo.result-label;
+                                    color: Theme.bg-primary;
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        // Position info
+                        Text {
+                            text: "r" + combo.key1-row + "c" + combo.key1-col + " + r" + combo.key2-row + "c" + combo.key2-col;
+                            color: Theme.fg-secondary;
+                            font-size: 9px;
+                            vertical-alignment: center;
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Delete";
+                                clicked => { AdvancedBridge.delete-combo(combo.index); }
+                            }
+                        }
+                    }
+                }
+
+                if AdvancedBridge.combos.length == 0 : Text {
+                    text: "No combos configured. Click Refresh All to load.";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
+                }
+            }
+
+            // ---- LEADER KEY ----
+            SectionHeader { title: "Leader Key"; expanded <=> AdvancedBridge.show-leader; }
+
+            if AdvancedBridge.show-leader : HorizontalLayout {
+                height: 36px;
+                padding-left: 8px;
+                Text {
+                    text: "Coming soon";
+                    color: Theme.fg-secondary;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+
+            // ---- KEY OVERRIDE ----
+            SectionHeader { title: "Key Override"; expanded <=> AdvancedBridge.show-ko; }
+
+            if AdvancedBridge.show-ko : HorizontalLayout {
+                height: 36px;
+                padding-left: 8px;
+                Text {
+                    text: "Coming soon";
+                    color: Theme.fg-secondary;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+
+            // ---- BLUETOOTH ----
+            SectionHeader { title: "Bluetooth"; expanded <=> AdvancedBridge.show-bt; }
+
+            if AdvancedBridge.show-bt : HorizontalLayout {
+                height: 36px;
+                padding-left: 8px;
+                Text {
+                    text: "Coming soon";
+                    color: Theme.fg-secondary;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+        }
     }
 }

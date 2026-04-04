@@ -182,6 +182,9 @@ enum BgMsg {
     Keymap(Vec<Vec<u16>>),
     LayerNames(Vec<String>),
     Disconnected,
+    TapDanceData(Vec<[u16; 4]>),
+    ComboData(Vec<logic::parsers::ComboEntry>),
+    StatusMsg(String),
 }
 
 fn build_keycap_model(keys: &[KeycapPos]) -> Rc<VecModel<KeycapData>> {
@@ -572,6 +575,135 @@ fn main() {
 
     window.global::<ConnectionBridge>().on_refresh_ports(|| {});
 
+    // --- AdvancedBridge: refresh-all ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        let window_weak = window.as_weak();
+        window.global::<AdvancedBridge>().on_refresh_all(move || {
+            if let Some(w) = window_weak.upgrade() {
+                w.global::<AppState>().set_status_text("Loading advanced data...".into());
+            }
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+
+                // Query tap dance data
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::TD_LIST, &[]) {
+                        Ok(resp) => {
+                            let td = logic::parsers::parse_td_binary(&resp.payload);
+                            let _ = tx.send(BgMsg::TapDanceData(td));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("TD error: {}", e))); }
+                    }
+                } else {
+                    match ser.query_command(logic::protocol::CMD_TAP_DANCE) {
+                        Ok(lines) => {
+                            let td = logic::parsers::parse_td_lines(&lines);
+                            let _ = tx.send(BgMsg::TapDanceData(td));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("TD error: {}", e))); }
+                    }
+                }
+
+                // Query combo data
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::COMBO_LIST, &[]) {
+                        Ok(resp) => {
+                            let combos = logic::parsers::parse_combo_binary(&resp.payload);
+                            let _ = tx.send(BgMsg::ComboData(combos));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Combo error: {}", e))); }
+                    }
+                } else {
+                    match ser.query_command(logic::protocol::CMD_COMBOS) {
+                        Ok(lines) => {
+                            let combos = logic::parsers::parse_combo_lines(&lines);
+                            let _ = tx.send(BgMsg::ComboData(combos));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Combo error: {}", e))); }
+                    }
+                }
+
+                let _ = tx.send(BgMsg::StatusMsg("Advanced data loaded".into()));
+            });
+        });
+    }
+
+    // --- AdvancedBridge: save-td ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        let window_weak = window.as_weak();
+        window.global::<AdvancedBridge>().on_save_td(move |slot_index| {
+            // Read current TD slot data from the model
+            let window = match window_weak.upgrade() {
+                Some(w) => w,
+                None => return,
+            };
+            let bridge = window.global::<AdvancedBridge>();
+            let slots_model = bridge.get_tap_dance_slots();
+            let idx = slot_index as usize;
+            if idx >= slots_model.row_count() { return; }
+            let slot = slots_model.row_data(idx).unwrap();
+
+            let actions: [u16; 4] = [
+                slot.tap1_code as u16,
+                slot.tap2_code as u16,
+                slot.tap3_code as u16,
+                slot.hold_code as u16,
+            ];
+
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    let payload = logic::binary_protocol::td_set_payload(slot_index as u8, &actions);
+                    match ser.send_binary(logic::binary_protocol::cmd::TD_SET, &payload) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("TD {} saved", slot_index))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("TD save error: {}", e))); }
+                    }
+                } else {
+                    let cmd = format!("TDSET {};{:02X},{:02X},{:02X},{:02X}",
+                        slot_index, actions[0], actions[1], actions[2], actions[3]);
+                    match ser.send_command(&cmd) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("TD {} saved", slot_index))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("TD save error: {}", e))); }
+                    }
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: delete-combo ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_delete_combo(move |combo_index| {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    let payload = vec![combo_index as u8];
+                    match ser.send_binary(logic::binary_protocol::cmd::COMBO_DELETE, &payload) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Combo {} deleted", combo_index))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Combo delete error: {}", e))); }
+                    }
+                } else {
+                    let cmd = logic::protocol::cmd_combodel(combo_index as u8);
+                    match ser.send_command(&cmd) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Combo {} deleted", combo_index))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Combo delete error: {}", e))); }
+                    }
+                }
+            });
+        });
+    }
+
     // --- Poll background messages via timer ---
     {
         let window_weak = window.as_weak();
@@ -622,6 +754,43 @@ fn main() {
                             app.set_connection(ConnectionState::Disconnected);
                             app.set_firmware_version(SharedString::default());
                             app.set_status_text("Disconnected".into());
+                        }
+                        BgMsg::TapDanceData(td_slots) => {
+                            let model: Vec<TapDanceSlot> = td_slots.iter().enumerate().map(|(i, actions)| {
+                                TapDanceSlot {
+                                    index: i as i32,
+                                    tap1: SharedString::from(logic::keycode::decode_keycode(actions[0])),
+                                    tap2: SharedString::from(logic::keycode::decode_keycode(actions[1])),
+                                    tap3: SharedString::from(logic::keycode::decode_keycode(actions[2])),
+                                    hold: SharedString::from(logic::keycode::decode_keycode(actions[3])),
+                                    tap1_code: actions[0] as i32,
+                                    tap2_code: actions[1] as i32,
+                                    tap3_code: actions[2] as i32,
+                                    hold_code: actions[3] as i32,
+                                }
+                            }).collect();
+                            let vec_model = Rc::new(VecModel::from(model));
+                            window.global::<AdvancedBridge>().set_tap_dance_slots(ModelRc::from(vec_model));
+                        }
+                        BgMsg::ComboData(combos) => {
+                            let model: Vec<ComboEntry> = combos.iter().map(|c| {
+                                ComboEntry {
+                                    index: c.index as i32,
+                                    key1_label: SharedString::from(format!("r{}c{}", c.r1, c.c1)),
+                                    key2_label: SharedString::from(format!("r{}c{}", c.r2, c.c2)),
+                                    result_label: SharedString::from(logic::keycode::decode_keycode(c.result)),
+                                    key1_row: c.r1 as i32,
+                                    key1_col: c.c1 as i32,
+                                    key2_row: c.r2 as i32,
+                                    key2_col: c.c2 as i32,
+                                    result_code: c.result as i32,
+                                }
+                            }).collect();
+                            let vec_model = Rc::new(VecModel::from(model));
+                            window.global::<AdvancedBridge>().set_combos(ModelRc::from(vec_model));
+                        }
+                        BgMsg::StatusMsg(msg) => {
+                            window.global::<AppState>().set_status_text(SharedString::from(msg));
                         }
                     }
                 }

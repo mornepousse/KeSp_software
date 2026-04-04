@@ -88,3 +88,40 @@ export global KeySelectorBridge {
     callback apply-hex();
     callback search-changed(string);
 }
+
+export struct TapDanceSlot {
+    index: int,
+    tap1: string,
+    tap2: string,
+    tap3: string,
+    hold: string,
+    tap1-code: int,
+    tap2-code: int,
+    tap3-code: int,
+    hold-code: int,
+}
+
+export struct ComboEntry {
+    index: int,
+    key1-label: string,
+    key2-label: string,
+    result-label: string,
+    key1-row: int,
+    key1-col: int,
+    key2-row: int,
+    key2-col: int,
+    result-code: int,
+}
+
+export global AdvancedBridge {
+    in property <[TapDanceSlot]> tap-dance-slots;
+    in property <[ComboEntry]> combos;
+    in-out property <bool> show-tap-dance: true;
+    in-out property <bool> show-combos: true;
+    in-out property <bool> show-leader: false;
+    in-out property <bool> show-ko: false;
+    in-out property <bool> show-bt: false;
+    callback refresh-all();
+    callback save-td(int);
+    callback delete-combo(int);
+}
