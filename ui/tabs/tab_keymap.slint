@@ -1,0 +1,94 @@
+import { Button, ComboBox } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { KeymapBridge, AppState } from "../globals.slint";
+import { KeyboardView } from "../components/keyboard_view.slint";
+
+export component TabKeymap inherits VerticalLayout {
+    padding: 12px;
+    spacing: 8px;
+
+    // Layer bar
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+
+        Text {
+            text: "Layer:";
+            color: Theme.fg-primary;
+            vertical-alignment: center;
+        }
+
+        for layer[idx] in KeymapBridge.layers : Rectangle {
+            width: 80px;
+            height: 32px;
+            border-radius: 4px;
+            background: layer.active ? Theme.accent-purple : Theme.button-bg;
+
+            Text {
+                text: layer.name;
+                color: Theme.fg-primary;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            TouchArea {
+                clicked => { KeymapBridge.switch-layer(layer.index); }
+                mouse-cursor: pointer;
+            }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        // Heatmap toggle
+        Rectangle {
+            width: 100px;
+            height: 32px;
+            border-radius: 4px;
+            background: KeymapBridge.heatmap-enabled ? Theme.accent-orange : Theme.button-bg;
+
+            Text {
+                text: "Heatmap";
+                color: Theme.fg-primary;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            TouchArea {
+                clicked => { KeymapBridge.heatmap-enabled = !KeymapBridge.heatmap-enabled; }
+                mouse-cursor: pointer;
+            }
+        }
+    }
+
+    // Keyboard view (main area)
+    KeyboardView {
+        vertical-stretch: 1;
+    }
+
+    // Selected key info bar
+    if KeymapBridge.selected-key-index >= 0 : Rectangle {
+        height: 40px;
+        background: Theme.bg-secondary;
+        border-radius: 4px;
+
+        HorizontalLayout {
+            padding: 8px;
+            spacing: 12px;
+
+            Text {
+                text: "Selected: " + KeymapBridge.selected-key-label;
+                color: Theme.accent-cyan;
+                vertical-alignment: center;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            Button {
+                text: "Change Key...";
+                clicked => {
+                    // TODO: open key selector modal
+                }
+            }
+        }
+    }
+}

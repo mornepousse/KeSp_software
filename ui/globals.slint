@@ -1,0 +1,60 @@
+// Shared data structures
+export struct KeycapData {
+    x: length,
+    y: length,
+    w: length,
+    h: length,
+    rotation: float,
+    rotation-cx: length,
+    rotation-cy: length,
+    label: string,
+    sublabel: string,
+    keycode: int,
+    color: color,
+    selected: bool,
+    index: int,
+}
+
+export struct LayerInfo {
+    index: int,
+    name: string,
+    active: bool,
+}
+
+export struct PortInfo {
+    name: string,
+    path: string,
+}
+
+export enum ConnectionState { disconnected, connecting, connected }
+export enum ActiveTab { keymap, advanced, macros, stats, settings }
+
+// Global singletons for Rust<->Slint bridge
+export global AppState {
+    in-out property <ConnectionState> connection: ConnectionState.disconnected;
+    in-out property <ActiveTab> active-tab: ActiveTab.keymap;
+    in-out property <string> status-text: "Disconnected";
+    in-out property <bool> spinner-visible: false;
+    in-out property <string> firmware-version: "";
+    in-out property <int> wpm: 0;
+}
+
+export global ConnectionBridge {
+    in property <[PortInfo]> ports;
+    in-out property <string> selected-port: "";
+    callback connect();
+    callback disconnect();
+    callback refresh-ports();
+}
+
+export global KeymapBridge {
+    in property <[KeycapData]> keycaps;
+    in property <[LayerInfo]> layers;
+    in-out property <int> selected-key-index: -1;
+    in-out property <int> active-layer: 0;
+    in-out property <string> selected-key-label: "";
+    in-out property <bool> heatmap-enabled: false;
+    callback select-key(int);
+    callback switch-layer(int);
+    callback change-key(int, int); // key-index, new-keycode
+}

@@ -1,0 +1,37 @@
+import { Theme } from "../theme.slint";
+import { KeycapData } from "../globals.slint";
+
+export component KeyButton inherits Rectangle {
+    in property <KeycapData> data;
+    callback clicked(int);
+
+    width: data.w;
+    height: data.h;
+    border-radius: 4px;
+    background: data.selected ? Theme.accent-purple : data.color;
+    border-width: 1px;
+    border-color: data.selected ? Theme.accent-cyan : Theme.bg-primary;
+
+    Text {
+        text: data.label;
+        color: Theme.fg-primary;
+        font-size: 11px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if data.sublabel != "" : Text {
+        y: parent.height - 14px;
+        text: data.sublabel;
+        color: Theme.fg-secondary;
+        font-size: 8px;
+        horizontal-alignment: center;
+        width: 100%;
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(data.index); }
+        mouse-cursor: pointer;
+    }
+
+}
