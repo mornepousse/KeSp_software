@@ -1,6 +1,6 @@
 import { Button, ComboBox } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
-import { KeymapBridge, AppState } from "../globals.slint";
+import { KeymapBridge, AppState, KeySelectorBridge, ModalKind } from "../globals.slint";
 import { KeyboardView } from "../components/keyboard_view.slint";
 
 export component TabKeymap inherits VerticalLayout {
@@ -86,7 +86,8 @@ export component TabKeymap inherits VerticalLayout {
             Button {
                 text: "Change Key...";
                 clicked => {
-                    // TODO: open key selector modal
+                    KeySelectorBridge.editing-key-index = KeymapBridge.selected-key-index;
+                    KeySelectorBridge.active-modal = ModalKind.key-selector;
                 }
             }
         }

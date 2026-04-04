@@ -10,6 +10,171 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::rc::Rc;
 
+/// Build the full list of keycode entries for the key selector, grouped by category.
+/// Entries with code=-1 are section headers.
+fn build_keycode_entries() -> Vec<KeycodeEntry> {
+    let mut e = Vec::new();
+
+    // Letters A-Z (0x04 - 0x1D)
+    push_header(&mut e, "Letters");
+    for code in 0x04u8..=0x1D {
+        push_entry(&mut e, code as i32, &keycode::hid_key_name(code), "Letters");
+    }
+
+    // Numbers 0-9 (0x1E - 0x27)
+    push_header(&mut e, "Numbers");
+    for code in 0x1Eu8..=0x27 {
+        push_entry(&mut e, code as i32, &keycode::hid_key_name(code), "Numbers");
+    }
+
+    // Modifiers (0xE0 - 0xE7)
+    push_header(&mut e, "Modifiers");
+    for code in 0xE0u8..=0xE7 {
+        push_entry(&mut e, code as i32, &keycode::hid_key_name(code), "Modifiers");
+    }
+
+    // Navigation
+    push_header(&mut e, "Navigation");
+    for code in [0x28u8, 0x29, 0x2A, 0x2B, 0x2C, 0x39, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52] {
+        push_entry(&mut e, code as i32, &keycode::hid_key_name(code), "Navigation");
+    }
+
+    // F-Keys (F1-F24)
+    push_header(&mut e, "F-Keys");
+    for code in 0x3Au8..=0x45 {
+        push_entry(&mut e, code as i32, &keycode::hid_key_name(code), "F-Keys");
+    }
+    for code in 0x68u8..=0x73 {
+        push_entry(&mut e, code as i32, &keycode::hid_key_name(code), "F-Keys");
+    }
+
+    // Punctuation
+    push_header(&mut e, "Punctuation");
+    for code in 0x2Du8..=0x38 {
+        push_entry(&mut e, code as i32, &keycode::hid_key_name(code), "Punctuation");
+    }
+
+    // Layers - MO, TO, OSL
+    push_header(&mut e, "Layers");
+    for layer in 0..10 {
+        let code = ((layer + 1) << 8) as i32;
+        push_entry(&mut e, code, &format!("MO {}", layer), "Layers");
+    }
+    for layer in 0..10 {
+        let code = ((layer + 0x0B) << 8) as i32;
+        push_entry(&mut e, code, &format!("TO {}", layer), "Layers");
+    }
+    for layer in 0..10 {
+        let code = (0x3100 + layer) as i32;
+        push_entry(&mut e, code, &format!("OSL {}", layer), "Layers");
+    }
+
+    // Special
+    push_header(&mut e, "Special");
+    let specials: &[(u16, &str)] = &[
+        (0x0000, "None"), (0x3200, "Caps Word"), (0x3300, "Repeat"),
+        (0x3400, "Leader"), (0x3500, "Feed"), (0x3600, "Play"),
+        (0x3700, "Sleep"), (0x3800, "Meds"), (0x3900, "GEsc"),
+        (0x3A00, "Layer Lock"), (0x3C00, "AS Toggle"),
+    ];
+    for &(code, label) in specials {
+        push_entry(&mut e, code as i32, label, "Special");
+    }
+
+    // One-Shot Mod
+    push_header(&mut e, "One-Shot Mod");
+    let osm_mods: &[(u8, &str)] = &[
+        (0x01, "OSM Ctrl"), (0x02, "OSM Shift"), (0x04, "OSM Alt"),
+        (0x08, "OSM GUI"), (0x10, "OSM RCtrl"), (0x20, "OSM RShift"),
+        (0x40, "OSM RAlt"), (0x80, "OSM RGUI"),
+    ];
+    for &(mod_mask, label) in osm_mods {
+        push_entry(&mut e, 0x3000 + mod_mask as i32, label, "One-Shot Mod");
+    }
+
+    // Bluetooth
+    push_header(&mut e, "Bluetooth");
+    let bt: &[(u16, &str)] = &[
+        (0x2900, "BT Next"), (0x2A00, "BT Prev"), (0x2B00, "BT Pair"),
+        (0x2C00, "BT Disc"), (0x2E00, "USB/BT"), (0x2F00, "BT On/Off"),
+    ];
+    for &(code, label) in bt {
+        push_entry(&mut e, code as i32, label, "Bluetooth");
+    }
+
+    // Media
+    push_header(&mut e, "Media");
+    let media: &[(u8, &str)] = &[
+        (0x7F, "Mute"), (0x80, "Vol Up"), (0x81, "Vol Down"),
+    ];
+    for &(code, label) in media {
+        push_entry(&mut e, code as i32, label, "Media");
+    }
+
+    // Numpad
+    push_header(&mut e, "Numpad");
+    for code in 0x53u8..=0x63 {
+        push_entry(&mut e, code as i32, &keycode::hid_key_name(code), "Numpad");
+    }
+
+    // Macros M1-M20
+    push_header(&mut e, "Macros");
+    for idx in 1..=20 {
+        let code = ((0x14 + idx) << 8) as i32;
+        push_entry(&mut e, code, &format!("M{}", idx), "Macros");
+    }
+
+    e
+}
+
+fn push_header(entries: &mut Vec<KeycodeEntry>, name: &str) {
+    entries.push(KeycodeEntry {
+        code: -1,
+        label: SharedString::from(name),
+        category: SharedString::from(name),
+    });
+}
+
+fn push_entry(entries: &mut Vec<KeycodeEntry>, code: i32, label: &str, category: &str) {
+    entries.push(KeycodeEntry {
+        code,
+        label: SharedString::from(label),
+        category: SharedString::from(category),
+    });
+}
+
+/// Filter keycode entries by search text (case-insensitive).
+/// Preserves section headers if the section has at least one matching entry.
+fn filter_keycode_entries(all: &[KeycodeEntry], filter: &str) -> Vec<KeycodeEntry> {
+    if filter.is_empty() {
+        return all.to_vec();
+    }
+    let lower = filter.to_lowercase();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < all.len() {
+        if all[i].code == -1 {
+            // This is a section header. Collect all entries in this section.
+            let header_idx = i;
+            i += 1;
+            let mut section_entries = Vec::new();
+            while i < all.len() && all[i].code != -1 {
+                if all[i].label.to_lowercase().contains(&lower) {
+                    section_entries.push(all[i].clone());
+                }
+                i += 1;
+            }
+            if !section_entries.is_empty() {
+                result.push(all[header_idx].clone());
+                result.extend(section_entries);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    result
+}
+
 // Messages from background serial thread to UI
 enum BgMsg {
     Connected(String, String, Vec<String>, Vec<Vec<u16>>), // port, fw_version, layer_names, keymap
@@ -108,6 +273,180 @@ fn main() {
     let current_keymap: Rc<std::cell::RefCell<Vec<Vec<u16>>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
     let current_layer: Rc<std::cell::Cell<usize>> = Rc::new(std::cell::Cell::new(0));
     let keyboard_layout = Rc::new(logic::layout_remap::KeyboardLayout::from_name("QWERTY"));
+
+    // --- Key selector setup ---
+    let all_keycode_entries = build_keycode_entries();
+    let keycode_model: Rc<VecModel<KeycodeEntry>> =
+        Rc::new(VecModel::from(all_keycode_entries.clone()));
+
+    {
+        let ks_bridge = window.global::<KeySelectorBridge>();
+        ks_bridge.set_entries(ModelRc::from(keycode_model.clone()));
+    }
+
+    // Key selector: search callback
+    {
+        let all_entries = all_keycode_entries.clone();
+        let keycode_model = keycode_model.clone();
+        window.global::<KeySelectorBridge>().on_search_changed(move |text| {
+            let filtered = filter_keycode_entries(&all_entries, text.as_str());
+            // Replace model contents
+            let count = keycode_model.row_count();
+            for _ in 0..count {
+                keycode_model.remove(0);
+            }
+            for e in filtered {
+                keycode_model.push(e);
+            }
+        });
+    }
+
+    // Key selector: select keycode callback
+    {
+        let keycap_model = keycap_model.clone();
+        let keys_arc = keys_arc.clone();
+        let current_keymap = current_keymap.clone();
+        let current_layer = current_layer.clone();
+        let keyboard_layout = keyboard_layout.clone();
+        let serial = serial.clone();
+        let all_entries = all_keycode_entries.clone();
+        let keycode_model_sel = keycode_model.clone();
+        let window_weak = window.as_weak();
+        window.global::<KeySelectorBridge>().on_select_keycode(move |code| {
+            let window = match window_weak.upgrade() {
+                Some(w) => w,
+                None => return,
+            };
+            let ks = window.global::<KeySelectorBridge>();
+            let key_idx = ks.get_editing_key_index();
+            if key_idx < 0 { return; }
+
+            let idx = key_idx as usize;
+            if idx >= keys_arc.len() { return; }
+
+            let kp = &keys_arc[idx];
+            let row = kp.row as usize;
+            let col = kp.col as usize;
+
+            // Update keymap in memory
+            {
+                let mut km = current_keymap.borrow_mut();
+                if row < km.len() && col < km[row].len() {
+                    km[row][col] = code as u16;
+                }
+            }
+
+            // Update keycap label
+            {
+                let decoded = keycode::decode_keycode(code as u16);
+                let remapped = logic::layout_remap::remap_key_label(&keyboard_layout, &decoded);
+                let label = remapped.unwrap_or(&decoded).to_string();
+                let mut item = keycap_model.row_data(idx).unwrap();
+                item.keycode = code;
+                item.label = SharedString::from(&label);
+                item.sublabel = if decoded != format!("0x{:04X}", code as u16) {
+                    SharedString::default()
+                } else {
+                    SharedString::from(format!("0x{:04X}", code as u16))
+                };
+                keycap_model.set_row_data(idx, item);
+            }
+
+            // Update selected key label
+            window.global::<KeymapBridge>().set_selected_key_label(
+                SharedString::from(keycode::decode_keycode(code as u16)),
+            );
+
+            // Send change to keyboard via serial
+            let layer = current_layer.get() as u8;
+            let serial = serial.clone();
+            let r = row as u8;
+            let c = col as u8;
+            let keycode_val = code as u16;
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if let Err(e) = ser.set_key(layer, r, c, keycode_val) {
+                    eprintln!("Failed to send key change: {}", e);
+                }
+            });
+
+            // Close modal and reset search + entries
+            ks.set_active_modal(ModalKind::None);
+            ks.set_search_filter(SharedString::default());
+            let count = keycode_model_sel.row_count();
+            for _ in 0..count {
+                keycode_model_sel.remove(0);
+            }
+            for e in &all_entries {
+                keycode_model_sel.push(e.clone());
+            }
+        });
+    }
+
+    // Key selector: cancel callback
+    {
+        let window_weak = window.as_weak();
+        let all_entries = all_keycode_entries.clone();
+        let keycode_model = keycode_model.clone();
+        window.global::<KeySelectorBridge>().on_cancel(move || {
+            if let Some(w) = window_weak.upgrade() {
+                let ks = w.global::<KeySelectorBridge>();
+                ks.set_active_modal(ModalKind::None);
+                ks.set_search_filter(SharedString::default());
+            }
+            // Reset entries to unfiltered
+            let count = keycode_model.row_count();
+            for _ in 0..count {
+                keycode_model.remove(0);
+            }
+            for e in &all_entries {
+                keycode_model.push(e.clone());
+            }
+        });
+    }
+
+    // Key selector: apply MT (mod-tap)
+    {
+        let window_weak = window.as_weak();
+        window.global::<KeySelectorBridge>().on_apply_mt(move || {
+            if let Some(w) = window_weak.upgrade() {
+                let ks = w.global::<KeySelectorBridge>();
+                let mod_nibble = ks.get_mt_mod() & 0x0F;
+                let key = ks.get_mt_key() & 0xFF;
+                let code = 0x5000 | (mod_nibble << 8) | key;
+                ks.invoke_select_keycode(code);
+            }
+        });
+    }
+
+    // Key selector: apply LT (layer-tap)
+    {
+        let window_weak = window.as_weak();
+        window.global::<KeySelectorBridge>().on_apply_lt(move || {
+            if let Some(w) = window_weak.upgrade() {
+                let ks = w.global::<KeySelectorBridge>();
+                let layer = ks.get_lt_layer() & 0x0F;
+                let key = ks.get_lt_key() & 0xFF;
+                let code = 0x4000 | (layer << 8) | key;
+                ks.invoke_select_keycode(code);
+            }
+        });
+    }
+
+    // Key selector: apply hex
+    {
+        let window_weak = window.as_weak();
+        window.global::<KeySelectorBridge>().on_apply_hex(move || {
+            if let Some(w) = window_weak.upgrade() {
+                let ks = w.global::<KeySelectorBridge>();
+                let hex_str = ks.get_hex_input().to_string();
+                let hex_str = hex_str.trim().trim_start_matches("0x").trim_start_matches("0X");
+                if let Ok(code) = u16::from_str_radix(hex_str, 16) {
+                    ks.invoke_select_keycode(code as i32);
+                }
+            }
+        });
+    }
 
     // --- Auto-connect on startup ---
     {

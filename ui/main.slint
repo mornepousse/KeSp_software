@@ -1,8 +1,9 @@
 import { TabWidget } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { AppState, ActiveTab } from "globals.slint";
+import { AppState, ActiveTab, KeySelectorBridge, ModalKind } from "globals.slint";
 import { ConnectionBar } from "components/connection_bar.slint";
 import { StatusBar } from "components/status_bar.slint";
+import { KeySelector } from "components/key_selector.slint";
 import { TabKeymap } from "tabs/tab_keymap.slint";
 import { TabAdvanced } from "tabs/tab_advanced.slint";
 import { TabMacros } from "tabs/tab_macros.slint";
@@ -11,6 +12,7 @@ import { TabSettings } from "tabs/tab_settings.slint";
 
 export { AppState, Theme }
 export { ConnectionBridge, KeymapBridge } from "globals.slint";
+export { KeySelectorBridge, KeycodeEntry, ModalKind } from "globals.slint";
 
 export component MainWindow inherits Window {
     title: "KaSe Controller";
@@ -48,4 +50,7 @@ export component MainWindow inherits Window {
 
         StatusBar { }
     }
+
+    // Key selector modal overlay
+    if KeySelectorBridge.active-modal == ModalKind.key-selector : KeySelector { }
 }

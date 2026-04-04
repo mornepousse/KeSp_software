@@ -479,6 +479,29 @@ impl SerialManager {
         }
     }
 
+    pub fn set_key(&mut self, layer: u8, row: u8, col: u8, keycode: u16) -> Result<(), String> {
+        let payload = vec![
+            layer,
+            row,
+            col,
+            (keycode & 0xFF) as u8,
+            (keycode >> 8) as u8,
+        ];
+
+        if self.v2 {
+            let resp = self.send_binary(bp::cmd::SETKEY, &payload)?;
+            if resp.is_ok() {
+                return Ok(());
+            }
+            return Err(format!("SETKEY failed: {}", resp.status_name()));
+        }
+
+        // Legacy fallback: text command
+        let cmd = format!("SETKEY {} {} {} {}", layer, row, col, keycode);
+        self.send_command(&cmd)?;
+        Ok(())
+    }
+
     pub fn get_layout_json(&mut self) -> Result<String, String> {
         // Try v2 binary first
         if self.v2 {

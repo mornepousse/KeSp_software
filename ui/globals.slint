@@ -58,3 +58,33 @@ export global KeymapBridge {
     callback switch-layer(int);
     callback change-key(int, int); // key-index, new-keycode
 }
+
+export struct KeycodeEntry {
+    code: int,
+    label: string,
+    category: string,
+}
+
+export enum ModalKind { none, key-selector }
+
+export global KeySelectorBridge {
+    in property <[KeycodeEntry]> entries;
+    in-out property <string> search-filter: "";
+    in-out property <ModalKind> active-modal: ModalKind.none;
+    in-out property <int> editing-key-index: -1;
+    // MT builder
+    in-out property <int> mt-mod: 2;
+    in-out property <int> mt-key: 4;
+    // LT builder
+    in-out property <int> lt-layer: 1;
+    in-out property <int> lt-key: 44;
+    // Hex input
+    in-out property <string> hex-input: "";
+
+    callback select-keycode(int); // code selected
+    callback cancel();
+    callback apply-mt();
+    callback apply-lt();
+    callback apply-hex();
+    callback search-changed(string);
+}
