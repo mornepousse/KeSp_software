@@ -3,16 +3,15 @@ import { KeycapData } from "../globals.slint";
 
 export component KeyButton inherits Rectangle {
     in property <KeycapData> data;
+    in property <float> render-scale: 1.0;
     callback clicked(int);
 
-    width: data.w;
-    height: data.h;
+    // Width and height controlled by parent (KeyboardView applies scaling)
     border-radius: 4px;
     background: data.color;
     border-width: 1px;
     border-color: #282a36;
 
-    // Selection overlay (conditional, no ternary on parent properties)
     if data.selected : Rectangle {
         background: #bd93f980;
         border-width: 2px;
@@ -23,16 +22,16 @@ export component KeyButton inherits Rectangle {
     Text {
         text: data.label;
         color: #f8f8f2;
-        font-size: 11px;
+        font-size: max(7px, 11px * root.render-scale);
         horizontal-alignment: center;
         vertical-alignment: center;
     }
 
     if data.sublabel != "" : Text {
-        y: parent.height - 14px;
+        y: parent.height - max(10px, 14px * root.render-scale);
         text: data.sublabel;
         color: #6272a4;
-        font-size: 8px;
+        font-size: max(6px, 8px * root.render-scale);
         horizontal-alignment: center;
         width: 100%;
     }

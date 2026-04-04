@@ -33,6 +33,14 @@ pub fn default_layout() -> Vec<KeycapPos> {
     parse_json(json).unwrap_or_default()
 }
 
+/// Compute the axis-aligned bounding box of all key positions.
+/// Returns (total_width, total_height) encompassing all keys.
+pub fn bounding_box(keys: &[KeycapPos]) -> (f32, f32) {
+    let max_x = keys.iter().map(|k| k.x + k.w).fold(0.0f32, f32::max);
+    let max_y = keys.iter().map(|k| k.y + k.h).fold(0.0f32, f32::max);
+    (max_x, max_y)
+}
+
 fn walk(node: &Value, ox: f32, oy: f32, parent_angle: f32, out: &mut Vec<KeycapPos>) {
     let obj = match node.as_object() {
         Some(o) => o,

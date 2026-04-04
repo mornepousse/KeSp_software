@@ -1,6 +1,6 @@
-import { Button, ScrollView } from "std-widgets.slint";
+import { Button, ScrollView, SpinBox, Switch } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
-import { AppState, ConnectionState, AdvancedBridge } from "../globals.slint";
+import { AppState, ConnectionState, AdvancedBridge, LeaderEntry, KeyOverrideEntry, BtSlotInfo } from "../globals.slint";
 
 component SectionHeader inherits Rectangle {
     in property <string> title;
@@ -259,42 +259,684 @@ export component TabAdvanced inherits Rectangle {
             // ---- LEADER KEY ----
             SectionHeader { title: "Leader Key"; expanded <=> AdvancedBridge.show-leader; }
 
-            if AdvancedBridge.show-leader : HorizontalLayout {
-                height: 36px;
+            if AdvancedBridge.show-leader : VerticalLayout {
+                spacing: 4px;
                 padding-left: 8px;
+                padding-right: 8px;
+
                 Text {
-                    text: "Coming soon";
+                    text: "A sequence of 1-4 keypresses that triggers an action.";
                     color: Theme.fg-secondary;
-                    font-size: 12px;
-                    vertical-alignment: center;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                for leader in AdvancedBridge.leaders : Rectangle {
+                    height: 44px;
+                    background: Theme.bg-surface;
+                    border-radius: 4px;
+
+                    HorizontalLayout {
+                        padding: 8px;
+                        spacing: 6px;
+
+                        Text {
+                            text: "#" + leader.index;
+                            color: Theme.accent-cyan;
+                            font-weight: 700;
+                            width: 32px;
+                            vertical-alignment: center;
+                        }
+
+                        // Sequence keys
+                        Rectangle {
+                            min-width: 120px;
+                            height: 30px;
+                            border-radius: 3px;
+                            background: Theme.button-bg;
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: leader.sequence;
+                                    color: Theme.fg-primary;
+                                    font-size: 11px;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "=";
+                            color: Theme.fg-secondary;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+
+                        // Result
+                        Rectangle {
+                            width: 90px;
+                            height: 30px;
+                            border-radius: 3px;
+                            background: Theme.accent-purple;
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: leader.result;
+                                    color: Theme.bg-primary;
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Delete";
+                                clicked => { AdvancedBridge.delete-leader(leader.index); }
+                            }
+                        }
+                    }
+                }
+
+                if AdvancedBridge.leaders.length == 0 : Text {
+                    text: "No leader keys configured. Click Refresh All to load.";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
                 }
             }
 
             // ---- KEY OVERRIDE ----
             SectionHeader { title: "Key Override"; expanded <=> AdvancedBridge.show-ko; }
 
-            if AdvancedBridge.show-ko : HorizontalLayout {
-                height: 36px;
+            if AdvancedBridge.show-ko : VerticalLayout {
+                spacing: 4px;
                 padding-left: 8px;
+                padding-right: 8px;
+
                 Text {
-                    text: "Coming soon";
+                    text: "Remap a key+modifier combination to a different key+modifier.";
                     color: Theme.fg-secondary;
-                    font-size: 12px;
-                    vertical-alignment: center;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                for ko in AdvancedBridge.key-overrides : Rectangle {
+                    height: 44px;
+                    background: Theme.bg-surface;
+                    border-radius: 4px;
+
+                    HorizontalLayout {
+                        padding: 8px;
+                        spacing: 6px;
+
+                        Text {
+                            text: "#" + ko.index;
+                            color: Theme.accent-cyan;
+                            font-weight: 700;
+                            width: 32px;
+                            vertical-alignment: center;
+                        }
+
+                        // Trigger key
+                        Rectangle {
+                            width: 70px;
+                            height: 30px;
+                            border-radius: 3px;
+                            background: Theme.button-bg;
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: ko.trigger-key;
+                                    color: Theme.fg-primary;
+                                    font-size: 11px;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "+";
+                            color: Theme.fg-secondary;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+
+                        // Trigger modifier
+                        Rectangle {
+                            width: 60px;
+                            height: 30px;
+                            border-radius: 3px;
+                            background: Theme.button-bg;
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: ko.trigger-mod;
+                                    color: Theme.fg-secondary;
+                                    font-size: 10px;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "=";
+                            color: Theme.fg-secondary;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+
+                        // Result key
+                        Rectangle {
+                            width: 70px;
+                            height: 30px;
+                            border-radius: 3px;
+                            background: Theme.accent-purple;
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: ko.result-key;
+                                    color: Theme.bg-primary;
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "+";
+                            color: Theme.fg-secondary;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+
+                        // Result modifier
+                        Rectangle {
+                            width: 60px;
+                            height: 30px;
+                            border-radius: 3px;
+                            background: Theme.accent-purple;
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: ko.result-mod;
+                                    color: Theme.bg-primary;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Delete";
+                                clicked => { AdvancedBridge.delete-ko(ko.index); }
+                            }
+                        }
+                    }
+                }
+
+                if AdvancedBridge.key-overrides.length == 0 : Text {
+                    text: "No key overrides configured. Click Refresh All to load.";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
                 }
             }
 
             // ---- BLUETOOTH ----
             SectionHeader { title: "Bluetooth"; expanded <=> AdvancedBridge.show-bt; }
 
-            if AdvancedBridge.show-bt : HorizontalLayout {
-                height: 36px;
+            if AdvancedBridge.show-bt : VerticalLayout {
+                spacing: 4px;
                 padding-left: 8px;
+                padding-right: 8px;
+
                 Text {
-                    text: "Coming soon";
+                    text: "Bluetooth connection management. Active slot: " + AdvancedBridge.bt-active-slot + "  Mode: " + AdvancedBridge.bt-mode;
                     color: Theme.fg-secondary;
-                    font-size: 12px;
-                    vertical-alignment: center;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                // BT slot list
+                for slot in AdvancedBridge.bt-slots : Rectangle {
+                    height: 40px;
+                    background: Theme.bg-surface;
+                    border-radius: 4px;
+
+                    HorizontalLayout {
+                        padding: 8px;
+                        spacing: 8px;
+
+                        // Slot number
+                        Text {
+                            text: "Slot " + slot.index;
+                            color: Theme.accent-cyan;
+                            font-weight: 700;
+                            width: 50px;
+                            vertical-alignment: center;
+                        }
+
+                        // Status indicator
+                        Rectangle {
+                            width: 80px;
+                            height: 26px;
+                            border-radius: 3px;
+                            background: slot.status == "Connected" ? Theme.accent-green
+                                      : slot.status == "Paired" ? Theme.accent-purple
+                                      : Theme.button-bg;
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: slot.status;
+                                    color: slot.status == "Empty" ? Theme.fg-secondary : Theme.bg-primary;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                        }
+
+                        // Device name
+                        Text {
+                            text: slot.name;
+                            color: Theme.fg-primary;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+
+                        // Address
+                        Text {
+                            text: slot.addr;
+                            color: Theme.fg-secondary;
+                            font-size: 9px;
+                            vertical-alignment: center;
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
+
+                if AdvancedBridge.bt-slots.length == 0 : Text {
+                    text: "No BT data. Click Refresh All to load.";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
+                }
+
+                // Action buttons
+                HorizontalLayout {
+                    spacing: 6px;
+                    padding-top: 4px;
+
+                    Button {
+                        text: "BT Prev";
+                        clicked => { AdvancedBridge.bt-prev(); }
+                    }
+                    Button {
+                        text: "BT Next";
+                        clicked => { AdvancedBridge.bt-next(); }
+                    }
+                    Button {
+                        text: "Pair";
+                        clicked => { AdvancedBridge.bt-pair(); }
+                    }
+                    Button {
+                        text: "Disconnect";
+                        clicked => { AdvancedBridge.bt-disconnect(); }
+                    }
+                    Button {
+                        text: "USB/BT Toggle";
+                        clicked => { AdvancedBridge.bt-toggle-usb-bt(); }
+                    }
+                }
+            }
+
+            // ---- AUTO SHIFT ----
+            SectionHeader { title: "Auto Shift"; expanded <=> AdvancedBridge.show-autoshift; }
+
+            if AdvancedBridge.show-autoshift : VerticalLayout {
+                spacing: 8px;
+                padding-left: 8px;
+                padding-right: 8px;
+
+                Text {
+                    text: "Hold a key slightly longer to type its shifted version automatically.";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: start;
+
+                    // Enable toggle
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: "Enabled";
+                            color: Theme.fg-primary;
+                            font-size: 11px;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Switch {
+                            checked <=> AdvancedBridge.autoshift-enabled;
+                        }
+                    }
+
+                    // Spacer
+                    Rectangle { width: 16px; }
+
+                    // Timeout
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: "Timeout (ms)";
+                            color: Theme.fg-primary;
+                            font-size: 11px;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        SpinBox {
+                            value <=> AdvancedBridge.autoshift-timeout;
+                            minimum: 50;
+                            maximum: 1000;
+                        }
+                    }
+
+                    // Spacer
+                    Rectangle { width: 16px; }
+
+                    VerticalLayout {
+                        alignment: center;
+                        Button {
+                            text: "Save";
+                            clicked => { AdvancedBridge.save-autoshift(); }
+                        }
+                    }
+                }
+            }
+
+            // ---- TRI-LAYER ----
+            SectionHeader { title: "Tri-Layer"; expanded <=> AdvancedBridge.show-tri-layer; }
+
+            if AdvancedBridge.show-tri-layer : VerticalLayout {
+                spacing: 8px;
+                padding-left: 8px;
+                padding-right: 8px;
+
+                Text {
+                    text: "Holding two layer keys simultaneously activates a third layer.";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: start;
+
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: "Layer 1";
+                            color: Theme.fg-primary;
+                            font-size: 11px;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        SpinBox {
+                            value <=> AdvancedBridge.tri-layer1;
+                            minimum: 0;
+                            maximum: 9;
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: "Layer 2";
+                            color: Theme.fg-primary;
+                            font-size: 11px;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        SpinBox {
+                            value <=> AdvancedBridge.tri-layer2;
+                            minimum: 0;
+                            maximum: 9;
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: "Activates";
+                            color: Theme.accent-purple;
+                            font-size: 11px;
+                            font-weight: 700;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        SpinBox {
+                            value <=> AdvancedBridge.tri-layer3;
+                            minimum: 0;
+                            maximum: 9;
+                        }
+                    }
+
+                    // Spacer
+                    Rectangle { width: 16px; }
+
+                    VerticalLayout {
+                        alignment: center;
+                        Button {
+                            text: "Save";
+                            clicked => { AdvancedBridge.save-tri-layer(); }
+                        }
+                    }
+                }
+            }
+
+            // ---- TAMAGOTCHI ----
+            SectionHeader { title: "Tamagotchi"; expanded <=> AdvancedBridge.show-tamagotchi; }
+
+            if AdvancedBridge.show-tamagotchi : VerticalLayout {
+                spacing: 8px;
+                padding-left: 8px;
+                padding-right: 8px;
+
+                Text {
+                    text: "Your virtual pet on the e-ink display. Keep it happy!";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                // Stats bars
+                VerticalLayout {
+                    spacing: 6px;
+
+                    // Hunger
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Hunger";
+                            color: Theme.fg-primary;
+                            font-size: 11px;
+                            width: 70px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            height: 16px;
+                            horizontal-stretch: 1;
+                            background: Theme.bg-surface;
+                            border-radius: 3px;
+                            Rectangle {
+                                x: 0;
+                                y: 0;
+                                width: parent.width * (AdvancedBridge.tama-hunger / 100);
+                                height: parent.height;
+                                border-radius: 3px;
+                                background: Theme.accent-orange;
+                            }
+                        }
+                        Text {
+                            text: AdvancedBridge.tama-hunger + "%";
+                            color: Theme.fg-secondary;
+                            font-size: 11px;
+                            width: 40px;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Happiness
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Happiness";
+                            color: Theme.fg-primary;
+                            font-size: 11px;
+                            width: 70px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            height: 16px;
+                            horizontal-stretch: 1;
+                            background: Theme.bg-surface;
+                            border-radius: 3px;
+                            Rectangle {
+                                x: 0;
+                                y: 0;
+                                width: parent.width * (AdvancedBridge.tama-happiness / 100);
+                                height: parent.height;
+                                border-radius: 3px;
+                                background: Theme.accent-yellow;
+                            }
+                        }
+                        Text {
+                            text: AdvancedBridge.tama-happiness + "%";
+                            color: Theme.fg-secondary;
+                            font-size: 11px;
+                            width: 40px;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Energy
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Energy";
+                            color: Theme.fg-primary;
+                            font-size: 11px;
+                            width: 70px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            height: 16px;
+                            horizontal-stretch: 1;
+                            background: Theme.bg-surface;
+                            border-radius: 3px;
+                            Rectangle {
+                                x: 0;
+                                y: 0;
+                                width: parent.width * (AdvancedBridge.tama-energy / 100);
+                                height: parent.height;
+                                border-radius: 3px;
+                                background: Theme.accent-cyan;
+                            }
+                        }
+                        Text {
+                            text: AdvancedBridge.tama-energy + "%";
+                            color: Theme.fg-secondary;
+                            font-size: 11px;
+                            width: 40px;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Health
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Health";
+                            color: Theme.fg-primary;
+                            font-size: 11px;
+                            width: 70px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            height: 16px;
+                            horizontal-stretch: 1;
+                            background: Theme.bg-surface;
+                            border-radius: 3px;
+                            Rectangle {
+                                x: 0;
+                                y: 0;
+                                width: parent.width * (AdvancedBridge.tama-health / 100);
+                                height: parent.height;
+                                border-radius: 3px;
+                                background: Theme.accent-green;
+                            }
+                        }
+                        Text {
+                            text: AdvancedBridge.tama-health + "%";
+                            color: Theme.fg-secondary;
+                            font-size: 11px;
+                            width: 40px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // Action buttons
+                HorizontalLayout {
+                    spacing: 6px;
+                    padding-top: 4px;
+
+                    Button {
+                        text: "Feed";
+                        clicked => { AdvancedBridge.tama-feed(); }
+                    }
+                    Button {
+                        text: "Play";
+                        clicked => { AdvancedBridge.tama-play(); }
+                    }
+                    Button {
+                        text: "Sleep";
+                        clicked => { AdvancedBridge.tama-sleep(); }
+                    }
+                    Button {
+                        text: "Meds";
+                        clicked => { AdvancedBridge.tama-meds(); }
+                    }
+                    Rectangle { width: 16px; }
+                    Button {
+                        text: "Refresh";
+                        clicked => { AdvancedBridge.refresh-tama(); }
+                    }
                 }
             }
         }

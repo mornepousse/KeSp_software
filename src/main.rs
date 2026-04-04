@@ -198,14 +198,24 @@ fn filter_keycode_entries(all: &[KeycodeEntry], filter: &str) -> Vec<KeycodeEntr
 // Messages from background serial thread to UI
 enum BgMsg {
     Connected(String, String, Vec<String>, Vec<Vec<u16>>), // port, fw_version, layer_names, keymap
+    LayoutJson(Vec<logic::layout::KeycapPos>), // physical layout received from firmware
     ConnectError(String),
     Keymap(Vec<Vec<u16>>),
     LayerNames(Vec<String>),
     Disconnected,
     TapDanceData(Vec<[u16; 4]>),
     ComboData(Vec<logic::parsers::ComboEntry>),
-    StatsData(Vec<Vec<u32>>, u32), // heatmap data, max_value
+    LeaderData(Vec<logic::parsers::LeaderEntry>),
+    KoData(Vec<[u8; 4]>),           // [trigger_key, trigger_mod, result_key, result_mod]
+    BtData(Vec<String>),            // raw BT status lines from parse_bt_binary
+    StatsData(Vec<Vec<u32>>, u32),  // heatmap data, max_value
+    MacroListData(Vec<logic::parsers::MacroEntry>),
+    Wpm(u16),
+    TamaData(i32, i32, i32, i32),     // hunger, happiness, energy, health
+    AutoShiftData(bool, i32),          // enabled, timeout_ms
+    PortList(Vec<(String, String)>),   // (display_name, path)
     StatusMsg(String),
+    Notification(String),
     OtaProgress(f32, String),
     FlashProgress(f32, String),
 }
@@ -285,10 +295,85 @@ fn update_keycap_labels(
     }
 }
 
+/// Build MacroStepInfo items from in-memory step data for the Slint model.
+fn build_macro_step_infos(steps: &[(String, u8, u32)]) -> Vec<MacroStepInfo> {
+    steps
+        .iter()
+        .map(|(action, kc, delay)| {
+            let label = if action == "delay" {
+                format!("{} ms", delay)
+            } else {
+                keycode::hid_key_name(*kc)
+            };
+            MacroStepInfo {
+                action_type: SharedString::from(action.as_str()),
+                keycode: *kc as i32,
+                label: SharedString::from(label),
+                delay_ms: *delay as i32,
+            }
+        })
+        .collect()
+}
+
+/// Build MacroInfo list items from parsed macro entries.
+fn build_macro_list(entries: &[logic::parsers::MacroEntry]) -> Vec<MacroInfo> {
+    entries
+        .iter()
+        .map(|e| MacroInfo {
+            slot: e.slot as i32,
+            name: SharedString::from(e.name.as_str()),
+            steps: e.steps.len() as i32,
+        })
+        .collect()
+}
+
+/// Convert firmware MacroStep entries into our in-memory edit format.
+/// Firmware format: keycode=0xFF means delay (modifier*10 ms),
+/// otherwise modifier is a bit field: bit0=press, bit1=release.
+/// If modifier==0x01 => press, 0x02 => release, 0x03 => tap (press+release).
+fn firmware_steps_to_edit(steps: &[logic::parsers::MacroStep]) -> Vec<(String, u8, u32)> {
+    steps
+        .iter()
+        .map(|s| {
+            if s.is_delay() {
+                ("delay".to_string(), 0, s.delay_ms())
+            } else {
+                let action = match s.modifier {
+                    0x01 => "press",
+                    0x02 => "release",
+                    _ => "tap", // 0x03 or default
+                };
+                (action.to_string(), s.keycode, 0)
+            }
+        })
+        .collect()
+}
+
+/// Convert in-memory edit steps back to firmware hex format "kc:mod,kc:mod,..."
+fn edit_steps_to_hex(steps: &[(String, u8, u32)]) -> String {
+    steps
+        .iter()
+        .map(|(action, kc, delay)| {
+            if action == "delay" {
+                // Delay: keycode=0xFF, modifier = delay_ms / 10
+                let ticks = (delay / 10).min(255) as u8;
+                format!("{:02X}:{:02X}", 0xFF, ticks)
+            } else {
+                let modifier = match action.as_str() {
+                    "press" => 0x01u8,
+                    "release" => 0x02u8,
+                    _ => 0x03u8, // tap
+                };
+                format!("{:02X}:{:02X}", kc, modifier)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn main() {
     let keys = logic::layout::default_layout();
-    let num_keys = keys.len();
-    let keys_arc = Arc::new(keys.clone());
+    let keys_arc: Arc<Mutex<Vec<KeycapPos>>> = Arc::new(Mutex::new(keys.clone()));
 
     let keycap_model = build_keycap_model(&keys);
     let layer_model = build_layer_model(&["Layer 0".into(), "Layer 1".into(), "Layer 2".into(), "Layer 3".into()]);
@@ -299,6 +384,16 @@ fn main() {
     let keymap_bridge = window.global::<KeymapBridge>();
     keymap_bridge.set_keycaps(ModelRc::from(keycap_model.clone()));
     keymap_bridge.set_layers(ModelRc::from(layer_model.clone()));
+
+    // Set layout bounding box for responsive keyboard scaling
+    {
+        let keys_guard = keys_arc.lock().unwrap();
+        let (bw, bh) = logic::layout::bounding_box(&keys_guard);
+        keymap_bridge.set_layout_width(bw);
+        keymap_bridge.set_layout_height(bh);
+        window.global::<StatsBridge>().set_layout_width(bw);
+        window.global::<StatsBridge>().set_layout_height(bh);
+    }
 
     // Serial manager shared between threads
     let serial: Arc<Mutex<SerialManager>> = Arc::new(Mutex::new(SerialManager::new()));
@@ -317,6 +412,14 @@ fn main() {
     let saved_settings = logic::settings::load();
     let keyboard_layout: Rc<std::cell::RefCell<logic::layout_remap::KeyboardLayout>> =
         Rc::new(std::cell::RefCell::new(logic::layout_remap::KeyboardLayout::from_name(&saved_settings.keyboard_layout)));
+
+    // Macro editor state: current steps being edited (shared across callbacks)
+    // Each entry: (action_type, keycode, delay_ms) where action_type is "press"/"release"/"tap"/"delay"
+    let macro_steps: Rc<std::cell::RefCell<Vec<(String, u8, u32)>>> =
+        Rc::new(std::cell::RefCell::new(Vec::new()));
+    // Full macro list from firmware (for building the list model)
+    let macro_entries: Rc<std::cell::RefCell<Vec<logic::parsers::MacroEntry>>> =
+        Rc::new(std::cell::RefCell::new(Vec::new()));
 
     // OTA / Flash file paths (shared with callbacks, need Arc<Mutex> for thread safety)
     let ota_firmware_path: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -370,11 +473,11 @@ fn main() {
             if key_idx < 0 { return; }
 
             let idx = key_idx as usize;
-            if idx >= keys_arc.len() { return; }
-
-            let kp = &keys_arc[idx];
-            let row = kp.row as usize;
-            let col = kp.col as usize;
+            let (row, col) = {
+                let keys_guard = keys_arc.lock().unwrap();
+                if idx >= keys_guard.len() { return; }
+                (keys_guard[idx].row as usize, keys_guard[idx].col as usize)
+            };
 
             // Update keymap in memory
             {
@@ -571,7 +674,8 @@ fn main() {
             if let Some(path) = dialog.save_file() {
                 let km = current_keymap.borrow();
                 let mut csv = String::from("Row,Col,Label,Keycode,Presses\n");
-                for (i, kp) in keys_arc.iter().enumerate() {
+                let keys_guard = keys_arc.lock().unwrap();
+                for (i, kp) in keys_guard.iter().enumerate() {
                     let row = kp.row as usize;
                     let col = kp.col as usize;
                     let label = if i < heatmap_keycaps.len() {
@@ -608,6 +712,21 @@ fn main() {
         });
     }
 
+    // --- Populate port list on startup ---
+    {
+        let detailed = SerialManager::list_ports_detailed();
+        let port_names: Vec<SharedString> = detailed.iter().map(|(d, _)| SharedString::from(d.as_str())).collect();
+        let port_names_model = Rc::new(VecModel::from(port_names));
+        window.global::<ConnectionBridge>().set_port_names(ModelRc::from(port_names_model));
+
+        let port_infos: Vec<PortInfo> = detailed.iter().map(|(d, p)| PortInfo {
+            name: SharedString::from(d.as_str()),
+            path: SharedString::from(p.as_str()),
+        }).collect();
+        let port_infos_model = Rc::new(VecModel::from(port_infos));
+        window.global::<ConnectionBridge>().set_ports(ModelRc::from(port_infos_model));
+    }
+
     // --- Auto-connect on startup ---
     {
         let serial = serial.clone();
@@ -623,6 +742,13 @@ fn main() {
                     let names = ser.get_layer_names().unwrap_or_default();
                     let km = ser.get_keymap(0).unwrap_or_default();
                     let _ = tx.send(BgMsg::Connected(port_name, fw, names, km));
+
+                    // Try to get physical layout from firmware
+                    if let Ok(json) = ser.get_layout_json() {
+                        if let Ok(keys) = logic::layout::parse_json(&json) {
+                            let _ = tx.send(BgMsg::LayoutJson(keys));
+                        }
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(BgMsg::ConnectError(e));
@@ -637,7 +763,7 @@ fn main() {
         let window_weak = window.as_weak();
         keymap_bridge.on_select_key(move |key_index| {
             let idx = key_index as usize;
-            if idx >= num_keys { return; }
+            if idx >= keycap_model.row_count() { return; }
             for i in 0..keycap_model.row_count() {
                 let mut item = keycap_model.row_data(i).unwrap();
                 let should_select = i == idx;
@@ -662,10 +788,16 @@ fn main() {
         let layer_model = layer_model.clone();
         let current_layer = current_layer.clone();
         let window_weak = window.as_weak();
+        let window_weak_layer = window.as_weak();
 
         keymap_bridge.on_switch_layer(move |layer_index| {
             let idx = layer_index as usize;
             current_layer.set(idx);
+
+            // Update active-layer property for UI reactivity
+            if let Some(w) = window_weak_layer.upgrade() {
+                w.global::<KeymapBridge>().set_active_layer(layer_index);
+            }
 
             // Update layer model UI
             for i in 0..layer_model.row_count() {
@@ -693,26 +825,317 @@ fn main() {
         });
     }
 
+    // --- KeymapBridge: toggle-heatmap ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        let keycap_model = keycap_model.clone();
+        let keys_arc = keys_arc.clone();
+        let current_keymap = current_keymap.clone();
+        let keyboard_layout = keyboard_layout.clone();
+        let window_weak = window.as_weak();
+        keymap_bridge.on_toggle_heatmap(move |enabled| {
+            if enabled {
+                // Query keystats from firmware and apply heatmap colors to keycap_model
+                if let Some(w) = window_weak.upgrade() {
+                    w.global::<AppState>().set_status_text("Loading heatmap...".into());
+                }
+                let serial = serial.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut ser = serial.lock().unwrap();
+                    if ser.v2 {
+                        match ser.send_binary(logic::binary_protocol::cmd::KEYSTATS_BIN, &[]) {
+                            Ok(resp) => {
+                                let (data, max_val) = logic::parsers::parse_keystats_binary(&resp.payload);
+                                let _ = tx.send(BgMsg::StatsData(data, max_val));
+                            }
+                            Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Heatmap error: {}", e))); }
+                        }
+                    } else {
+                        match ser.query_command(logic::protocol::CMD_KEYSTATS) {
+                            Ok(lines) => {
+                                let (data, max_val) = logic::parsers::parse_heatmap_lines(&lines);
+                                let _ = tx.send(BgMsg::StatsData(data, max_val));
+                            }
+                            Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Heatmap error: {}", e))); }
+                        }
+                    }
+                });
+            } else {
+                // Reset keycap colors back to default gray
+                let keys_guard = keys_arc.lock().unwrap();
+                let km = current_keymap.borrow();
+                for i in 0..keycap_model.row_count() {
+                    let mut item = keycap_model.row_data(i).unwrap();
+                    item.color = slint::Color::from_argb_u8(255, 0x44, 0x47, 0x5a);
+                    item.sublabel = SharedString::default();
+                    keycap_model.set_row_data(i, item);
+                }
+                // Re-apply labels from keymap (sublabels were overwritten with counts)
+                if !km.is_empty() {
+                    update_keycap_labels(&keycap_model, &keys_guard, &km, &keyboard_layout.borrow());
+                }
+                if let Some(w) = window_weak.upgrade() {
+                    w.global::<AppState>().set_status_text("Heatmap disabled".into());
+                }
+            }
+        });
+    }
+
+    // --- KeymapBridge: export-keymap ---
+    {
+        let current_keymap = current_keymap.clone();
+        let current_layer = current_layer.clone();
+        let window_weak = window.as_weak();
+        keymap_bridge.on_export_keymap(move || {
+            let km = current_keymap.borrow();
+            let layer = current_layer.get();
+            if km.is_empty() {
+                if let Some(w) = window_weak.upgrade() {
+                    w.global::<AppState>().set_status_text("No keymap data to export".into());
+                }
+                return;
+            }
+
+            // Get layer name from bridge
+            let layer_name = if let Some(w) = window_weak.upgrade() {
+                let layers_model = w.global::<KeymapBridge>().get_layers();
+                if (layer as usize) < layers_model.row_count() {
+                    layers_model.row_data(layer as usize)
+                        .map(|l| l.name.to_string())
+                        .unwrap_or_else(|| format!("Layer {}", layer))
+                } else {
+                    format!("Layer {}", layer)
+                }
+            } else {
+                format!("Layer {}", layer)
+            };
+
+            // Build JSON: {"layer": N, "layer_name": "...", "rows": [[keycode, ...], ...]}
+            let export = serde_json::json!({
+                "layer": layer,
+                "layer_name": layer_name,
+                "rows": *km,
+            });
+            let json = serde_json::to_string_pretty(&export).unwrap_or_default();
+
+            let dialog = rfd::FileDialog::new()
+                .set_title("Export Keymap")
+                .add_filter("JSON", &["json"])
+                .set_file_name(&format!("keymap_layer{}.json", layer));
+
+            if let Some(path) = dialog.save_file() {
+                match std::fs::write(&path, &json) {
+                    Ok(_) => {
+                        if let Some(w) = window_weak.upgrade() {
+                            w.global::<AppState>().set_notification_text(
+                                SharedString::from(format!("Keymap exported to {}", path.display()))
+                            );
+                            w.global::<AppState>().set_notification_visible(true);
+                            w.global::<AppState>().set_status_text(
+                                SharedString::from(format!("Exported layer {} to {}", layer, path.display()))
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(w) = window_weak.upgrade() {
+                            w.global::<AppState>().set_status_text(
+                                SharedString::from(format!("Export error: {}", e))
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // --- KeymapBridge: import-keymap ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        let current_layer = current_layer.clone();
+        keymap_bridge.on_import_keymap(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            let layer = current_layer.get() as u8;
+            std::thread::spawn(move || {
+                let dialog = rfd::FileDialog::new()
+                    .set_title("Import Keymap")
+                    .add_filter("JSON", &["json"])
+                    .pick_file();
+
+                let path = match dialog {
+                    Some(p) => p,
+                    None => {
+                        let _ = tx.send(BgMsg::StatusMsg("Import cancelled".into()));
+                        return;
+                    }
+                };
+
+                let contents = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(BgMsg::StatusMsg(format!("Read error: {}", e)));
+                        return;
+                    }
+                };
+
+                let parsed: serde_json::Value = match serde_json::from_str(&contents) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx.send(BgMsg::StatusMsg(format!("JSON parse error: {}", e)));
+                        return;
+                    }
+                };
+
+                // Determine which layer to import into:
+                // Use "layer" field from JSON if present, otherwise use current layer
+                let target_layer = parsed.get("layer")
+                    .and_then(|v| v.as_u64())
+                    .map(|l| l as u8)
+                    .unwrap_or(layer);
+
+                let rows = match parsed.get("rows").and_then(|v| v.as_array()) {
+                    Some(arr) => arr,
+                    None => {
+                        let _ = tx.send(BgMsg::StatusMsg("Invalid keymap JSON: missing 'rows'".into()));
+                        return;
+                    }
+                };
+
+                let mut ser = serial.lock().unwrap();
+                if !ser.connected {
+                    let _ = tx.send(BgMsg::StatusMsg("Not connected".into()));
+                    return;
+                }
+
+                let _ = tx.send(BgMsg::StatusMsg(format!("Importing keymap to layer {}...", target_layer)));
+
+                for (row_idx, row_val) in rows.iter().enumerate() {
+                    let cols = match row_val.as_array() {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    for (col_idx, code_val) in cols.iter().enumerate() {
+                        let code = code_val.as_u64().unwrap_or(0) as u16;
+                        if let Err(e) = ser.set_key(target_layer, row_idx as u8, col_idx as u8, code) {
+                            let _ = tx.send(BgMsg::StatusMsg(format!("Import error at R{}C{}: {}", row_idx, col_idx, e)));
+                            return;
+                        }
+                    }
+                }
+
+                // Reload keymap for the target layer
+                match ser.get_keymap(target_layer) {
+                    Ok(km) => { let _ = tx.send(BgMsg::Keymap(km)); }
+                    Err(_) => {}
+                }
+                let _ = tx.send(BgMsg::Notification("Keymap imported successfully".into()));
+            });
+        });
+    }
+
+    // --- KeymapBridge: rename-layer ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        keymap_bridge.on_rename_layer(move |layer_index, new_name| {
+            let name = new_name.to_string();
+            if name.is_empty() {
+                let _ = tx.send(BgMsg::StatusMsg("Layer name cannot be empty".into()));
+                return;
+            }
+            let serial = serial.clone();
+            let tx = tx.clone();
+            let layer = layer_index as u8;
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if !ser.connected {
+                    let _ = tx.send(BgMsg::StatusMsg("Not connected".into()));
+                    return;
+                }
+
+                if ser.v2 {
+                    // Binary v2: LAYER_NAME command, payload = [layer_index, name_bytes...]
+                    let mut payload = vec![layer];
+                    payload.extend_from_slice(name.as_bytes());
+                    match ser.send_binary(logic::binary_protocol::cmd::LAYER_NAME, &payload) {
+                        Ok(_) => {
+                            let _ = tx.send(BgMsg::Notification(format!("Layer {} renamed to '{}'", layer, name)));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(BgMsg::StatusMsg(format!("Rename error: {}", e)));
+                            return;
+                        }
+                    }
+                } else {
+                    // Legacy: LAYOUTNAME0:MyLayer
+                    let cmd = logic::protocol::cmd_set_layer_name(layer, &name);
+                    if let Err(e) = ser.send_command(&cmd) {
+                        let _ = tx.send(BgMsg::StatusMsg(format!("Rename error: {}", e)));
+                        return;
+                    }
+                    let _ = tx.send(BgMsg::Notification(format!("Layer {} renamed to '{}'", layer, name)));
+                }
+
+                // Reload layer names
+                match ser.get_layer_names() {
+                    Ok(names) => { let _ = tx.send(BgMsg::LayerNames(names)); }
+                    Err(_) => {}
+                }
+            });
+        });
+    }
+
     // --- Connect/Disconnect callbacks ---
     {
         let serial_c = serial.clone();
         let tx_c = bg_tx.clone();
         let window_weak = window.as_weak();
         window.global::<ConnectionBridge>().on_connect(move || {
-            if let Some(w) = window_weak.upgrade() {
-                w.global::<AppState>().set_status_text("Scanning ports...".into());
+            // Read selected port path from the bridge
+            let selected_path = if let Some(w) = window_weak.upgrade() {
+                w.global::<AppState>().set_status_text("Connecting...".into());
                 w.global::<AppState>().set_connection(ConnectionState::Connecting);
-            }
+                let bridge = w.global::<ConnectionBridge>();
+                let idx = bridge.get_selected_port_index();
+                if idx >= 0 {
+                    let ports_model = bridge.get_ports();
+                    if (idx as usize) < ports_model.row_count() {
+                        ports_model.row_data(idx as usize).map(|pi| pi.path.to_string()).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
             let serial = serial_c.clone();
             let tx = tx_c.clone();
             std::thread::spawn(move || {
                 let mut ser = serial.lock().unwrap();
-                match ser.auto_connect() {
+                let connect_result = if selected_path.is_empty() {
+                    // No port selected: auto-connect by VID/PID
+                    ser.auto_connect()
+                } else {
+                    // Connect to the specific selected port
+                    ser.connect(&selected_path).map(|_| selected_path.clone())
+                };
+                match connect_result {
                     Ok(port_name) => {
                         let fw = ser.get_firmware_version().unwrap_or_default();
                         let names = ser.get_layer_names().unwrap_or_default();
                         let km = ser.get_keymap(0).unwrap_or_default();
                         let _ = tx.send(BgMsg::Connected(port_name, fw, names, km));
+
+                        if let Ok(json) = ser.get_layout_json() {
+                            if let Ok(keys) = logic::layout::parse_json(&json) {
+                                let _ = tx.send(BgMsg::LayoutJson(keys));
+                            }
+                        }
                     }
                     Err(e) => { let _ = tx.send(BgMsg::ConnectError(e)); }
                 }
@@ -730,7 +1153,17 @@ fn main() {
         });
     }
 
-    window.global::<ConnectionBridge>().on_refresh_ports(|| {});
+    // --- Refresh ports callback ---
+    {
+        let tx = bg_tx.clone();
+        window.global::<ConnectionBridge>().on_refresh_ports(move || {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let ports = SerialManager::list_ports_detailed();
+                let _ = tx.send(BgMsg::PortList(ports));
+            });
+        });
+    }
 
     // --- AdvancedBridge: refresh-all ---
     {
@@ -781,6 +1214,124 @@ fn main() {
                             let _ = tx.send(BgMsg::ComboData(combos));
                         }
                         Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Combo error: {}", e))); }
+                    }
+                }
+
+                // Query leader data
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::LEADER_LIST, &[]) {
+                        Ok(resp) => {
+                            let leaders = logic::parsers::parse_leader_binary(&resp.payload);
+                            let _ = tx.send(BgMsg::LeaderData(leaders));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Leader error: {}", e))); }
+                    }
+                } else {
+                    match ser.query_command(logic::protocol::CMD_LEADER) {
+                        Ok(lines) => {
+                            let leaders = logic::parsers::parse_leader_lines(&lines);
+                            let _ = tx.send(BgMsg::LeaderData(leaders));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Leader error: {}", e))); }
+                    }
+                }
+
+                // Query key override data
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::KO_LIST, &[]) {
+                        Ok(resp) => {
+                            let kos = logic::parsers::parse_ko_binary(&resp.payload);
+                            let _ = tx.send(BgMsg::KoData(kos));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("KO error: {}", e))); }
+                    }
+                } else {
+                    match ser.query_command(logic::protocol::CMD_KEY_OVERRIDE) {
+                        Ok(lines) => {
+                            let kos = logic::parsers::parse_ko_lines(&lines);
+                            let _ = tx.send(BgMsg::KoData(kos));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("KO error: {}", e))); }
+                    }
+                }
+
+                // Query bluetooth data
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::BT_QUERY, &[]) {
+                        Ok(resp) => {
+                            let bt_lines = logic::parsers::parse_bt_binary(&resp.payload);
+                            let _ = tx.send(BgMsg::BtData(bt_lines));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("BT error: {}", e))); }
+                    }
+                } else {
+                    match ser.query_command(logic::protocol::CMD_BT_STATUS) {
+                        Ok(lines) => {
+                            let _ = tx.send(BgMsg::BtData(lines));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("BT error: {}", e))); }
+                    }
+                }
+
+                // Query autoshift data
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::AUTOSHIFT_TOGGLE, &[0xFF]) {
+                        Ok(resp) => {
+                            // Payload: [enabled:u8][timeout:u16 LE]
+                            if resp.payload.len() >= 3 {
+                                let enabled = resp.payload[0] != 0;
+                                let timeout = u16::from_le_bytes([resp.payload[1], resp.payload[2]]) as i32;
+                                let _ = tx.send(BgMsg::AutoShiftData(enabled, timeout));
+                            }
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("AutoShift error: {}", e))); }
+                    }
+                }
+
+                // Query tamagotchi data
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::TAMA_QUERY, &[]) {
+                        Ok(resp) => {
+                            let lines = logic::parsers::parse_tama_binary(&resp.payload);
+                            // Parse the summary line: "TAMA: Lv1 hunger=75 happy=60 energy=90 health=80 keys=1234 enabled=1"
+                            for line in &lines {
+                                if line.starts_with("TAMA:") {
+                                    let parse_val = |key: &str| -> i32 {
+                                        line.find(key)
+                                            .and_then(|i| line[i + key.len()..].split_whitespace().next())
+                                            .and_then(|v| v.parse::<i32>().ok())
+                                            .unwrap_or(0)
+                                    };
+                                    let hunger = parse_val("hunger=");
+                                    let happiness = parse_val("happy=");
+                                    let energy = parse_val("energy=");
+                                    let health = parse_val("health=");
+                                    let _ = tx.send(BgMsg::TamaData(hunger, happiness, energy, health));
+                                }
+                            }
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tama error: {}", e))); }
+                    }
+                } else {
+                    match ser.query_command(logic::protocol::CMD_TAMA) {
+                        Ok(lines) => {
+                            for line in &lines {
+                                if line.starts_with("TAMA:") {
+                                    let parse_val = |key: &str| -> i32 {
+                                        line.find(key)
+                                            .and_then(|i| line[i + key.len()..].split_whitespace().next())
+                                            .and_then(|v| v.parse::<i32>().ok())
+                                            .unwrap_or(0)
+                                    };
+                                    let hunger = parse_val("hunger=");
+                                    let happiness = parse_val("happy=");
+                                    let energy = parse_val("energy=");
+                                    let health = parse_val("health=");
+                                    let _ = tx.send(BgMsg::TamaData(hunger, happiness, energy, health));
+                                }
+                            }
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tama error: {}", e))); }
                     }
                 }
 
@@ -861,6 +1412,626 @@ fn main() {
         });
     }
 
+    // --- AdvancedBridge: delete-leader ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_delete_leader(move |leader_index| {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    let payload = vec![leader_index as u8];
+                    match ser.send_binary(logic::binary_protocol::cmd::LEADER_DELETE, &payload) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Leader {} deleted", leader_index))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Leader delete error: {}", e))); }
+                    }
+                } else {
+                    let cmd = logic::protocol::cmd_leaderdel(leader_index as u8);
+                    match ser.send_command(&cmd) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Leader {} deleted", leader_index))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Leader delete error: {}", e))); }
+                    }
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: delete-ko ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_delete_ko(move |ko_index| {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    let payload = vec![ko_index as u8];
+                    match ser.send_binary(logic::binary_protocol::cmd::KO_DELETE, &payload) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("KO {} deleted", ko_index))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("KO delete error: {}", e))); }
+                    }
+                } else {
+                    let cmd = logic::protocol::cmd_kodel(ko_index as u8);
+                    match ser.send_command(&cmd) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("KO {} deleted", ko_index))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("KO delete error: {}", e))); }
+                    }
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: bt-next ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_bt_next(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::BT_NEXT, &[]) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg("BT Next".into())); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("BT Next error: {}", e))); }
+                    }
+                } else {
+                    let _ = ser.send_command("BT NEXT");
+                    let _ = tx.send(BgMsg::StatusMsg("BT Next".into()));
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: bt-prev ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_bt_prev(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::BT_PREV, &[]) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg("BT Prev".into())); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("BT Prev error: {}", e))); }
+                    }
+                } else {
+                    let _ = ser.send_command("BT PREV");
+                    let _ = tx.send(BgMsg::StatusMsg("BT Prev".into()));
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: bt-pair ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_bt_pair(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::BT_PAIR, &[]) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg("BT Pairing...".into())); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("BT Pair error: {}", e))); }
+                    }
+                } else {
+                    let _ = ser.send_command("BT PAIR");
+                    let _ = tx.send(BgMsg::StatusMsg("BT Pairing...".into()));
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: bt-disconnect ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_bt_disconnect(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::BT_DISCONNECT, &[]) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg("BT Disconnected".into())); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("BT Disconnect error: {}", e))); }
+                    }
+                } else {
+                    let _ = ser.send_command("BT DISCONNECT");
+                    let _ = tx.send(BgMsg::StatusMsg("BT Disconnected".into()));
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: bt-toggle-usb-bt ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_bt_toggle_usb_bt(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    // BT_SWITCH with slot=0xFF acts as USB/BT toggle
+                    match ser.send_binary(logic::binary_protocol::cmd::BT_SWITCH, &[0xFF]) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg("USB/BT toggled".into())); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("USB/BT toggle error: {}", e))); }
+                    }
+                } else {
+                    let _ = ser.send_command("BT TOGGLE");
+                    let _ = tx.send(BgMsg::StatusMsg("USB/BT toggled".into()));
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: save-autoshift ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        let window_weak = window.as_weak();
+        window.global::<AdvancedBridge>().on_save_autoshift(move || {
+            let window = match window_weak.upgrade() {
+                Some(w) => w,
+                None => return,
+            };
+            let bridge = window.global::<AdvancedBridge>();
+            let enabled = bridge.get_autoshift_enabled();
+            let timeout = bridge.get_autoshift_timeout() as u16;
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    let payload = vec![
+                        if enabled { 1u8 } else { 0u8 },
+                        (timeout & 0xFF) as u8,
+                        (timeout >> 8) as u8,
+                    ];
+                    match ser.send_binary(logic::binary_protocol::cmd::AUTOSHIFT_TOGGLE, &payload) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Auto Shift: {} timeout={}ms", if enabled { "ON" } else { "OFF" }, timeout))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("AutoShift error: {}", e))); }
+                    }
+                } else {
+                    let cmd = if enabled {
+                        format!("AUTOSHIFT ON {}", timeout)
+                    } else {
+                        "AUTOSHIFT OFF".to_string()
+                    };
+                    match ser.send_command(&cmd) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Auto Shift: {} timeout={}ms", if enabled { "ON" } else { "OFF" }, timeout))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("AutoShift error: {}", e))); }
+                    }
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: save-tri-layer ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        let window_weak = window.as_weak();
+        window.global::<AdvancedBridge>().on_save_tri_layer(move || {
+            let window = match window_weak.upgrade() {
+                Some(w) => w,
+                None => return,
+            };
+            let bridge = window.global::<AdvancedBridge>();
+            let l1 = bridge.get_tri_layer1() as u8;
+            let l2 = bridge.get_tri_layer2() as u8;
+            let l3 = bridge.get_tri_layer3() as u8;
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    let payload = vec![l1, l2, l3];
+                    match ser.send_binary(logic::binary_protocol::cmd::TRILAYER_SET, &payload) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tri-Layer set: {} + {} = {}", l1, l2, l3))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tri-Layer error: {}", e))); }
+                    }
+                } else {
+                    let cmd = logic::protocol::cmd_trilayer(l1, l2, l3);
+                    match ser.send_command(&cmd) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tri-Layer set: {} + {} = {}", l1, l2, l3))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tri-Layer error: {}", e))); }
+                    }
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: tama-feed ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_tama_feed(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::TAMA_FEED, &[]) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg("Tama: Fed!".into())); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tama Feed error: {}", e))); }
+                    }
+                } else {
+                    let _ = ser.send_command("TAMA FEED");
+                    let _ = tx.send(BgMsg::StatusMsg("Tama: Fed!".into()));
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: tama-play ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_tama_play(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::TAMA_PLAY, &[]) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg("Tama: Played!".into())); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tama Play error: {}", e))); }
+                    }
+                } else {
+                    let _ = ser.send_command("TAMA PLAY");
+                    let _ = tx.send(BgMsg::StatusMsg("Tama: Played!".into()));
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: tama-sleep ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_tama_sleep(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::TAMA_SLEEP, &[]) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg("Tama: Sleeping...".into())); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tama Sleep error: {}", e))); }
+                    }
+                } else {
+                    let _ = ser.send_command("TAMA SLEEP");
+                    let _ = tx.send(BgMsg::StatusMsg("Tama: Sleeping...".into()));
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: tama-meds ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_tama_meds(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::TAMA_MEDICINE, &[]) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg("Tama: Medicine given!".into())); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tama Meds error: {}", e))); }
+                    }
+                } else {
+                    let _ = ser.send_command("TAMA MEDS");
+                    let _ = tx.send(BgMsg::StatusMsg("Tama: Medicine given!".into()));
+                }
+            });
+        });
+    }
+
+    // --- AdvancedBridge: refresh-tama ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<AdvancedBridge>().on_refresh_tama(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::TAMA_QUERY, &[]) {
+                        Ok(resp) => {
+                            let lines = logic::parsers::parse_tama_binary(&resp.payload);
+                            for line in &lines {
+                                if line.starts_with("TAMA:") {
+                                    let parse_val = |key: &str| -> i32 {
+                                        line.find(key)
+                                            .and_then(|i| line[i + key.len()..].split_whitespace().next())
+                                            .and_then(|v| v.parse::<i32>().ok())
+                                            .unwrap_or(0)
+                                    };
+                                    let hunger = parse_val("hunger=");
+                                    let happiness = parse_val("happy=");
+                                    let energy = parse_val("energy=");
+                                    let health = parse_val("health=");
+                                    let _ = tx.send(BgMsg::TamaData(hunger, happiness, energy, health));
+                                }
+                            }
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tama error: {}", e))); }
+                    }
+                } else {
+                    match ser.query_command(logic::protocol::CMD_TAMA) {
+                        Ok(lines) => {
+                            for line in &lines {
+                                if line.starts_with("TAMA:") {
+                                    let parse_val = |key: &str| -> i32 {
+                                        line.find(key)
+                                            .and_then(|i| line[i + key.len()..].split_whitespace().next())
+                                            .and_then(|v| v.parse::<i32>().ok())
+                                            .unwrap_or(0)
+                                    };
+                                    let hunger = parse_val("hunger=");
+                                    let happiness = parse_val("happy=");
+                                    let energy = parse_val("energy=");
+                                    let health = parse_val("health=");
+                                    let _ = tx.send(BgMsg::TamaData(hunger, happiness, energy, health));
+                                }
+                            }
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Tama error: {}", e))); }
+                    }
+                }
+            });
+        });
+    }
+
+    // --- MacroBridge: refresh-macros ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        let window_weak = window.as_weak();
+        window.global::<MacroBridge>().on_refresh_macros(move || {
+            if let Some(w) = window_weak.upgrade() {
+                w.global::<AppState>().set_status_text("Loading macros...".into());
+            }
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::LIST_MACROS, &[]) {
+                        Ok(resp) => {
+                            let entries = logic::parsers::parse_macros_binary(&resp.payload);
+                            let _ = tx.send(BgMsg::MacroListData(entries));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Macro error: {}", e))); }
+                    }
+                } else {
+                    match ser.query_command(logic::protocol::CMD_MACROS_TEXT) {
+                        Ok(lines) => {
+                            let entries = logic::parsers::parse_macro_lines(&lines);
+                            let _ = tx.send(BgMsg::MacroListData(entries));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Macro error: {}", e))); }
+                    }
+                }
+            });
+        });
+    }
+
+    // --- MacroBridge: select-macro ---
+    {
+        let macro_entries = macro_entries.clone();
+        let macro_steps = macro_steps.clone();
+        let window_weak = window.as_weak();
+        window.global::<MacroBridge>().on_select_macro(move |slot| {
+            let window = match window_weak.upgrade() {
+                Some(w) => w,
+                None => return,
+            };
+            let bridge = window.global::<MacroBridge>();
+            bridge.set_selected_macro(slot);
+            let entries = macro_entries.borrow();
+            let found = entries.iter().find(|e| e.slot as i32 == slot);
+            match found {
+                Some(entry) => {
+                    bridge.set_macro_name(SharedString::from(entry.name.as_str()));
+                    let edit_steps = firmware_steps_to_edit(&entry.steps);
+                    let infos = build_macro_step_infos(&edit_steps);
+                    *macro_steps.borrow_mut() = edit_steps;
+                    bridge.set_current_steps(ModelRc::from(Rc::new(VecModel::from(infos))));
+                }
+                None => {
+                    bridge.set_macro_name(SharedString::default());
+                    macro_steps.borrow_mut().clear();
+                    bridge.set_current_steps(ModelRc::from(Rc::new(VecModel::<MacroStepInfo>::from(vec![]))));
+                }
+            }
+        });
+    }
+
+    // --- MacroBridge: new-macro ---
+    {
+        let macro_entries = macro_entries.clone();
+        let macro_steps = macro_steps.clone();
+        let window_weak = window.as_weak();
+        window.global::<MacroBridge>().on_new_macro(move || {
+            let window = match window_weak.upgrade() { Some(w) => w, None => return };
+            let bridge = window.global::<MacroBridge>();
+            let entries = macro_entries.borrow();
+            let used: Vec<u8> = entries.iter().map(|e| e.slot).collect();
+            match (0u8..16).find(|s| !used.contains(s)) {
+                Some(slot) => {
+                    bridge.set_selected_macro(slot as i32);
+                    bridge.set_macro_name(SharedString::from(format!("Macro{}", slot)));
+                    macro_steps.borrow_mut().clear();
+                    bridge.set_current_steps(ModelRc::from(Rc::new(VecModel::<MacroStepInfo>::from(vec![]))));
+                }
+                None => {
+                    window.global::<AppState>().set_status_text("All 16 macro slots are used".into());
+                }
+            }
+        });
+    }
+
+    // --- MacroBridge: add-step ---
+    {
+        let macro_steps = macro_steps.clone();
+        let window_weak = window.as_weak();
+        window.global::<MacroBridge>().on_add_step(move |action_type, keycode_or_delay| {
+            let window = match window_weak.upgrade() { Some(w) => w, None => return };
+            let bridge = window.global::<MacroBridge>();
+            let action = action_type.to_string();
+            let mut steps = macro_steps.borrow_mut();
+            if action == "delay" {
+                let delay_str = bridge.get_delay_input().to_string();
+                let delay_ms: u32 = delay_str.trim().parse().unwrap_or(50);
+                steps.push(("delay".to_string(), 0, delay_ms));
+            } else {
+                steps.push((action, keycode_or_delay as u8, 0));
+            }
+            let infos = build_macro_step_infos(&steps);
+            bridge.set_current_steps(ModelRc::from(Rc::new(VecModel::from(infos))));
+        });
+    }
+
+    // --- MacroBridge: remove-step ---
+    {
+        let macro_steps = macro_steps.clone();
+        let window_weak = window.as_weak();
+        window.global::<MacroBridge>().on_remove_step(move |idx| {
+            let window = match window_weak.upgrade() { Some(w) => w, None => return };
+            let bridge = window.global::<MacroBridge>();
+            let mut steps = macro_steps.borrow_mut();
+            let i = idx as usize;
+            if i < steps.len() { steps.remove(i); }
+            let infos = build_macro_step_infos(&steps);
+            bridge.set_current_steps(ModelRc::from(Rc::new(VecModel::from(infos))));
+        });
+    }
+
+    // --- MacroBridge: move-step-up ---
+    {
+        let macro_steps = macro_steps.clone();
+        let window_weak = window.as_weak();
+        window.global::<MacroBridge>().on_move_step_up(move |idx| {
+            let window = match window_weak.upgrade() { Some(w) => w, None => return };
+            let bridge = window.global::<MacroBridge>();
+            let mut steps = macro_steps.borrow_mut();
+            let i = idx as usize;
+            if i > 0 && i < steps.len() { steps.swap(i, i - 1); }
+            let infos = build_macro_step_infos(&steps);
+            bridge.set_current_steps(ModelRc::from(Rc::new(VecModel::from(infos))));
+        });
+    }
+
+    // --- MacroBridge: move-step-down ---
+    {
+        let macro_steps = macro_steps.clone();
+        let window_weak = window.as_weak();
+        window.global::<MacroBridge>().on_move_step_down(move |idx| {
+            let window = match window_weak.upgrade() { Some(w) => w, None => return };
+            let bridge = window.global::<MacroBridge>();
+            let mut steps = macro_steps.borrow_mut();
+            let i = idx as usize;
+            if i + 1 < steps.len() { steps.swap(i, i + 1); }
+            let infos = build_macro_step_infos(&steps);
+            bridge.set_current_steps(ModelRc::from(Rc::new(VecModel::from(infos))));
+        });
+    }
+
+    // --- MacroBridge: save-macro ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        let macro_steps = macro_steps.clone();
+        let window_weak = window.as_weak();
+        window.global::<MacroBridge>().on_save_macro(move || {
+            let window = match window_weak.upgrade() { Some(w) => w, None => return };
+            let bridge = window.global::<MacroBridge>();
+            let slot = bridge.get_selected_macro();
+            if slot < 0 { return; }
+            let name = bridge.get_macro_name().to_string();
+            let steps = macro_steps.borrow();
+            let steps_hex = edit_steps_to_hex(&steps);
+            let slot_u8 = slot as u8;
+            window.global::<AppState>().set_status_text(SharedString::from(format!("Saving macro {}...", slot)));
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    let payload = logic::binary_protocol::macro_add_seq_payload(slot_u8, &name, &steps_hex);
+                    match ser.send_binary(logic::binary_protocol::cmd::MACRO_ADD_SEQ, &payload) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Macro {} saved", slot))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Macro save error: {}", e))); }
+                    }
+                } else {
+                    let cmd = logic::protocol::cmd_macroseq(slot_u8, &name, &steps_hex);
+                    match ser.send_command(&cmd) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Macro {} saved", slot))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Macro save error: {}", e))); }
+                    }
+                }
+            });
+        });
+    }
+
+    // --- MacroBridge: delete-macro ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        let macro_steps = macro_steps.clone();
+        let macro_entries = macro_entries.clone();
+        let window_weak = window.as_weak();
+        window.global::<MacroBridge>().on_delete_macro(move |slot| {
+            if slot < 0 { return; }
+            let slot_u8 = slot as u8;
+            macro_steps.borrow_mut().clear();
+            { macro_entries.borrow_mut().retain(|e| e.slot != slot_u8); }
+            if let Some(w) = window_weak.upgrade() {
+                let bridge = w.global::<MacroBridge>();
+                bridge.set_selected_macro(-1);
+                bridge.set_macro_name(SharedString::default());
+                bridge.set_current_steps(ModelRc::from(Rc::new(VecModel::<MacroStepInfo>::from(vec![]))));
+                let entries = macro_entries.borrow();
+                let list = build_macro_list(&entries);
+                bridge.set_macros(ModelRc::from(Rc::new(VecModel::from(list))));
+                w.global::<AppState>().set_status_text(SharedString::from(format!("Deleting macro {}...", slot)));
+            }
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    let payload = logic::binary_protocol::macro_delete_payload(slot_u8);
+                    match ser.send_binary(logic::binary_protocol::cmd::MACRO_DELETE, &payload) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Macro {} deleted", slot))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Macro delete error: {}", e))); }
+                    }
+                } else {
+                    let cmd = logic::protocol::cmd_macro_del(slot_u8);
+                    match ser.send_command(&cmd) {
+                        Ok(_) => { let _ = tx.send(BgMsg::StatusMsg(format!("Macro {} deleted", slot))); }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Macro delete error: {}", e))); }
+                    }
+                }
+            });
+        });
+    }
+
     // --- SettingsBridge setup ---
     {
         // Populate available layouts
@@ -910,7 +2081,7 @@ fn main() {
             // Re-render keycap labels with new layout
             let km = current_keymap.borrow();
             if !km.is_empty() {
-                update_keycap_labels(&keycap_model, &keys_arc, &km, &new_layout);
+                update_keycap_labels(&keycap_model, &keys_arc.lock().unwrap(), &km, &new_layout);
             }
 
             if let Some(w) = window_weak.upgrade() {
@@ -1255,21 +2426,107 @@ fn main() {
         });
     }
 
-    // --- Process background messages (event-driven, no polling) ---
+    // --- Process background messages + auto-reconnect + WPM polling ---
     {
         let window_weak = window.as_weak();
         let keycap_model = keycap_model.clone();
         let keys_arc = keys_arc.clone();
         let current_keymap = current_keymap.clone();
         let keyboard_layout = keyboard_layout.clone();
+        let macro_entries = macro_entries.clone();
+        let serial_timer = serial.clone();
+        let tx_timer = bg_tx.clone();
 
-        // Single-shot timer at 0ms — only restarts when invoke_from_event_loop wakes us
+        // Tick counter: incremented every 200ms
+        // Every 15 ticks (3s): auto-reconnect if disconnected
+        // Every 10 ticks (2s): WPM poll if connected
+        let tick_counter = std::cell::Cell::new(0u32);
+        // Track if a reconnect attempt is in progress to avoid spamming
+        let reconnect_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Notification auto-hide: counts down from 15 (3 seconds) when shown
+        let notification_countdown = std::cell::Cell::new(0u32);
+
         let timer = slint::Timer::default();
         timer.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_millis(200),
             move || {
                 let Some(window) = window_weak.upgrade() else { return };
+
+                // Increment tick counter
+                let ticks = tick_counter.get().wrapping_add(1);
+                tick_counter.set(ticks);
+
+                // Notification auto-hide logic
+                {
+                    let app = window.global::<AppState>();
+                    if app.get_notification_visible() {
+                        let count = notification_countdown.get();
+                        if count == 0 {
+                            // Just became visible: start countdown (15 ticks = 3s)
+                            notification_countdown.set(15);
+                        } else if count == 1 {
+                            // Time's up: hide notification
+                            app.set_notification_visible(false);
+                            notification_countdown.set(0);
+                        } else {
+                            notification_countdown.set(count - 1);
+                        }
+                    } else {
+                        notification_countdown.set(0);
+                    }
+                }
+
+                // Auto-reconnect every 15 ticks (3 seconds)
+                if ticks % 15 == 0 {
+                    let is_disconnected = window.global::<AppState>().get_connection() == ConnectionState::Disconnected;
+                    let not_already_trying = !reconnect_in_progress.load(std::sync::atomic::Ordering::Relaxed);
+                    if is_disconnected && not_already_trying {
+                        let serial = serial_timer.clone();
+                        let tx = tx_timer.clone();
+                        let flag = reconnect_in_progress.clone();
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        std::thread::spawn(move || {
+                            let mut ser = serial.lock().unwrap();
+                            match ser.auto_connect() {
+                                Ok(port_name) => {
+                                    let fw = ser.get_firmware_version().unwrap_or_default();
+                                    let names = ser.get_layer_names().unwrap_or_default();
+                                    let km = ser.get_keymap(0).unwrap_or_default();
+                                    let _ = tx.send(BgMsg::Connected(port_name, fw, names, km));
+
+                                    if let Ok(json) = ser.get_layout_json() {
+                                        if let Ok(keys) = logic::layout::parse_json(&json) {
+                                            let _ = tx.send(BgMsg::LayoutJson(keys));
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    // Silently fail — will retry next cycle
+                                }
+                            }
+                            flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                        });
+                    }
+                }
+
+                // WPM polling every 10 ticks (2 seconds)
+                if ticks % 10 == 0 {
+                    let is_connected = window.global::<AppState>().get_connection() == ConnectionState::Connected;
+                    if is_connected {
+                        let serial = serial_timer.clone();
+                        let tx = tx_timer.clone();
+                        std::thread::spawn(move || {
+                            let mut ser = serial.lock().unwrap();
+                            if ser.connected {
+                                match ser.get_wpm() {
+                                    Ok(wpm) => { let _ = tx.send(BgMsg::Wpm(wpm)); }
+                                    Err(_) => {} // Silently ignore WPM errors
+                                }
+                            }
+                        });
+                    }
+                }
 
                 while let Ok(msg) = bg_rx.try_recv() {
                     match msg {
@@ -1285,7 +2542,7 @@ fn main() {
 
                             // Update keymap
                             *current_keymap.borrow_mut() = km.clone();
-                            update_keycap_labels(&keycap_model, &keys_arc, &km, &keyboard_layout.borrow());
+                            update_keycap_labels(&keycap_model, &keys_arc.lock().unwrap(), &km, &keyboard_layout.borrow());
                         }
                         BgMsg::ConnectError(e) => {
                             let app = window.global::<AppState>();
@@ -1294,12 +2551,57 @@ fn main() {
                         }
                         BgMsg::Keymap(km) => {
                             *current_keymap.borrow_mut() = km.clone();
-                            update_keycap_labels(&keycap_model, &keys_arc, &km, &keyboard_layout.borrow());
+                            update_keycap_labels(&keycap_model, &keys_arc.lock().unwrap(), &km, &keyboard_layout.borrow());
                             window.global::<AppState>().set_status_text("Keymap loaded".into());
                         }
                         BgMsg::LayerNames(names) => {
                             let new_layers = build_layer_model(&names);
                             window.global::<KeymapBridge>().set_layers(ModelRc::from(new_layers));
+                        }
+                        BgMsg::LayoutJson(new_keys) => {
+                            // Replace the shared layout
+                            *keys_arc.lock().unwrap() = new_keys.clone();
+
+                            // Rebuild keycap data and repopulate existing model
+                            // (keeps all Rc<VecModel> references valid)
+                            let count = keycap_model.row_count();
+                            for _ in 0..count {
+                                keycap_model.remove(0);
+                            }
+                            for (idx, kp) in new_keys.iter().enumerate() {
+                                keycap_model.push(KeycapData {
+                                    x: kp.x,
+                                    y: kp.y,
+                                    w: kp.w,
+                                    h: kp.h,
+                                    rotation: kp.angle,
+                                    rotation_cx: kp.w / 2.0,
+                                    rotation_cy: kp.h / 2.0,
+                                    label: SharedString::from(format!("{},{}", kp.col, kp.row)),
+                                    sublabel: SharedString::default(),
+                                    keycode: 0,
+                                    color: slint::Color::from_argb_u8(255, 0x44, 0x47, 0x5a),
+                                    selected: false,
+                                    index: idx as i32,
+                                });
+                            }
+
+                            // If there's a current keymap, update labels
+                            let km = current_keymap.borrow();
+                            if !km.is_empty() {
+                                update_keycap_labels(&keycap_model, &new_keys, &km, &keyboard_layout.borrow());
+                            }
+
+                            // Update bounding box for responsive scaling
+                            let (bw, bh) = logic::layout::bounding_box(&new_keys);
+                            window.global::<KeymapBridge>().set_layout_width(bw);
+                            window.global::<KeymapBridge>().set_layout_height(bh);
+                            window.global::<StatsBridge>().set_layout_width(bw);
+                            window.global::<StatsBridge>().set_layout_height(bh);
+
+                            window.global::<AppState>().set_status_text(
+                                SharedString::from(format!("Layout received from firmware ({} keys)", new_keys.len()))
+                            );
                         }
                         BgMsg::Disconnected => {
                             let app = window.global::<AppState>();
@@ -1325,11 +2627,30 @@ fn main() {
                             window.global::<AdvancedBridge>().set_tap_dance_slots(ModelRc::from(vec_model));
                         }
                         BgMsg::ComboData(combos) => {
+                            let km = current_keymap.borrow();
+                            let layout = keyboard_layout.borrow();
                             let model: Vec<ComboEntry> = combos.iter().map(|c| {
+                                // Look up key labels from the current keymap instead of "rXcY"
+                                let key1_label = km.get(c.r1 as usize)
+                                    .and_then(|row| row.get(c.c1 as usize))
+                                    .map(|&code| {
+                                        let decoded = keycode::decode_keycode(code);
+                                        let remapped = logic::layout_remap::remap_key_label(&layout, &decoded);
+                                        remapped.unwrap_or(&decoded).to_string()
+                                    })
+                                    .unwrap_or_else(|| format!("r{}c{}", c.r1, c.c1));
+                                let key2_label = km.get(c.r2 as usize)
+                                    .and_then(|row| row.get(c.c2 as usize))
+                                    .map(|&code| {
+                                        let decoded = keycode::decode_keycode(code);
+                                        let remapped = logic::layout_remap::remap_key_label(&layout, &decoded);
+                                        remapped.unwrap_or(&decoded).to_string()
+                                    })
+                                    .unwrap_or_else(|| format!("r{}c{}", c.r2, c.c2));
                                 ComboEntry {
                                     index: c.index as i32,
-                                    key1_label: SharedString::from(format!("r{}c{}", c.r1, c.c1)),
-                                    key2_label: SharedString::from(format!("r{}c{}", c.r2, c.c2)),
+                                    key1_label: SharedString::from(key1_label),
+                                    key2_label: SharedString::from(key2_label),
                                     result_label: SharedString::from(logic::keycode::decode_keycode(c.result)),
                                     key1_row: c.r1 as i32,
                                     key1_col: c.c1 as i32,
@@ -1340,6 +2661,125 @@ fn main() {
                             }).collect();
                             let vec_model = Rc::new(VecModel::from(model));
                             window.global::<AdvancedBridge>().set_combos(ModelRc::from(vec_model));
+                        }
+                        BgMsg::LeaderData(leaders) => {
+                            let model: Vec<LeaderEntry> = leaders.iter().map(|l| {
+                                // Build sequence string: "A -> B -> C"
+                                let seq_str = l.sequence.iter()
+                                    .map(|&k| keycode::hid_key_name(k))
+                                    .collect::<Vec<_>>()
+                                    .join(" -> ");
+                                // Build result string: "Key" or "Key + Mod"
+                                let key_name = keycode::hid_key_name(l.result);
+                                let result_str = if l.result_mod != 0 {
+                                    format!("{} + {}", key_name, keycode::mod_name(l.result_mod))
+                                } else {
+                                    key_name
+                                };
+                                LeaderEntry {
+                                    index: l.index as i32,
+                                    sequence: SharedString::from(seq_str),
+                                    result: SharedString::from(result_str),
+                                    result_code: l.result as i32,
+                                    result_mod: l.result_mod as i32,
+                                }
+                            }).collect();
+                            let vec_model = Rc::new(VecModel::from(model));
+                            window.global::<AdvancedBridge>().set_leaders(ModelRc::from(vec_model));
+                        }
+                        BgMsg::KoData(kos) => {
+                            let model: Vec<KeyOverrideEntry> = kos.iter().enumerate().map(|(i, ko)| {
+                                let trig_key = keycode::hid_key_name(ko[0]);
+                                let trig_mod = if ko[1] != 0 { keycode::mod_name(ko[1]) } else { "None".to_string() };
+                                let res_key = keycode::hid_key_name(ko[2]);
+                                let res_mod = if ko[3] != 0 { keycode::mod_name(ko[3]) } else { "None".to_string() };
+                                KeyOverrideEntry {
+                                    index: i as i32,
+                                    trigger_key: SharedString::from(trig_key),
+                                    trigger_mod: SharedString::from(trig_mod),
+                                    result_key: SharedString::from(res_key),
+                                    result_mod: SharedString::from(res_mod),
+                                }
+                            }).collect();
+                            let vec_model = Rc::new(VecModel::from(model));
+                            window.global::<AdvancedBridge>().set_key_overrides(ModelRc::from(vec_model));
+                        }
+                        BgMsg::BtData(bt_lines) => {
+                            // Parse BT status lines
+                            // First line: "BT: slot=X init=Y conn=Z pairing=W"
+                            // Subsequent: "BT slot N: valid=V addr=AA:BB:CC:DD:EE:FF name=NAME"
+                            let mut active_slot: i32 = 0;
+                            let mut connected: u8 = 0;
+                            let mut bt_mode = "USB";
+                            let mut slots: Vec<BtSlotInfo> = Vec::new();
+
+                            for line in &bt_lines {
+                                if line.starts_with("BT:") {
+                                    // Parse global state
+                                    if let Some(s) = line.find("slot=") {
+                                        let rest = &line[s + 5..];
+                                        if let Some(val) = rest.split_whitespace().next() {
+                                            active_slot = val.parse().unwrap_or(0);
+                                        }
+                                    }
+                                    if let Some(s) = line.find("conn=") {
+                                        let rest = &line[s + 5..];
+                                        if let Some(val) = rest.split_whitespace().next() {
+                                            connected = val.parse().unwrap_or(0);
+                                        }
+                                    }
+                                    if let Some(s) = line.find("init=") {
+                                        let rest = &line[s + 5..];
+                                        if let Some(val) = rest.split_whitespace().next() {
+                                            let init: u8 = val.parse().unwrap_or(0);
+                                            bt_mode = if init != 0 { "BT" } else { "USB" };
+                                        }
+                                    }
+                                } else if line.starts_with("BT slot") {
+                                    // Parse slot info
+                                    let slot_idx = line.chars()
+                                        .skip(8)
+                                        .take_while(|c| c.is_ascii_digit())
+                                        .collect::<String>()
+                                        .parse::<i32>()
+                                        .unwrap_or(0);
+
+                                    let valid = line.find("valid=")
+                                        .and_then(|s| line[s + 6..].split_whitespace().next())
+                                        .and_then(|v| v.parse::<u8>().ok())
+                                        .unwrap_or(0);
+
+                                    let addr = line.find("addr=")
+                                        .and_then(|s| line[s + 5..].split_whitespace().next())
+                                        .unwrap_or("")
+                                        .to_string();
+
+                                    let name = line.find("name=")
+                                        .map(|s| line[s + 5..].trim().to_string())
+                                        .unwrap_or_default();
+
+                                    let status = if connected != 0 && slot_idx == active_slot {
+                                        "Connected"
+                                    } else if valid != 0 {
+                                        "Paired"
+                                    } else {
+                                        "Empty"
+                                    };
+
+                                    slots.push(BtSlotInfo {
+                                        index: slot_idx,
+                                        status: SharedString::from(status),
+                                        name: SharedString::from(name),
+                                        addr: SharedString::from(addr),
+                                    });
+                                }
+                            }
+
+                            let bridge = window.global::<AdvancedBridge>();
+                            bridge.set_bt_active_slot(active_slot);
+                            bridge.set_bt_mode(SharedString::from(bt_mode));
+                            let vec_model = Rc::new(VecModel::from(slots));
+                            bridge.set_bt_slots(ModelRc::from(vec_model));
                         }
                         BgMsg::StatsData(heatmap_data, max_val) => {
                             // Build heatmap keycaps: same positions as regular but
@@ -1352,7 +2792,8 @@ fn main() {
                             }
 
                             let km = current_keymap.borrow();
-                            let heatmap_keycaps: Vec<KeycapData> = keys_arc
+                            let keys_guard = keys_arc.lock().unwrap();
+                            let heatmap_keycaps: Vec<KeycapData> = keys_guard
                                 .iter()
                                 .enumerate()
                                 .map(|(idx, kp)| {
@@ -1441,10 +2882,49 @@ fn main() {
                             }
 
                             stats_bridge.set_stats_summary(SharedString::from(summary));
+
+                            // If keymap heatmap toggle is active, also colorize the main keycap model
+                            if window.global::<KeymapBridge>().get_heatmap_enabled() {
+                                for i in 0..keycap_model.row_count() {
+                                    let kp = &keys_guard[i];
+                                    let row = kp.row as usize;
+                                    let col = kp.col as usize;
+                                    let count = heatmap_data
+                                        .get(row)
+                                        .and_then(|r| r.get(col))
+                                        .copied()
+                                        .unwrap_or(0);
+                                    let value = if max_val > 0 {
+                                        count as f32 / max_val as f32
+                                    } else {
+                                        0.0
+                                    };
+                                    let mut item = keycap_model.row_data(i).unwrap();
+                                    item.color = heatmap_color(value);
+                                    item.sublabel = SharedString::from(format!("{}", count));
+                                    keycap_model.set_row_data(i, item);
+                                }
+                            }
+
                             window.global::<AppState>().set_status_text("Stats loaded".into());
+                        }
+                        BgMsg::MacroListData(entries) => {
+                            *macro_entries.borrow_mut() = entries.clone();
+                            let list = build_macro_list(&entries);
+                            let list_model = Rc::new(VecModel::from(list));
+                            window.global::<MacroBridge>().set_macros(ModelRc::from(list_model));
+                            window.global::<AppState>().set_status_text(
+                                SharedString::from(format!("{} macros loaded", entries.len()))
+                            );
                         }
                         BgMsg::StatusMsg(msg) => {
                             window.global::<AppState>().set_status_text(SharedString::from(msg));
+                        }
+                        BgMsg::Notification(msg) => {
+                            let app = window.global::<AppState>();
+                            app.set_notification_text(SharedString::from(&msg));
+                            app.set_notification_visible(true);
+                            app.set_status_text(SharedString::from(msg));
                         }
                         BgMsg::OtaProgress(progress, status) => {
                             let sb = window.global::<SettingsBridge>();
@@ -1458,6 +2938,35 @@ fn main() {
                             let sb = window.global::<SettingsBridge>();
                             sb.set_flash_progress(progress);
                             sb.set_flash_status(SharedString::from(status));
+                        }
+                        BgMsg::Wpm(wpm) => {
+                            window.global::<AppState>().set_wpm(wpm as i32);
+                        }
+                        BgMsg::PortList(ports) => {
+                            let port_model: Vec<PortInfo> = ports.iter().map(|(name, path)| {
+                                PortInfo {
+                                    name: SharedString::from(name.as_str()),
+                                    path: SharedString::from(path.as_str()),
+                                }
+                            }).collect();
+                            let names_model: Vec<SharedString> = ports.iter()
+                                .map(|(name, _)| SharedString::from(name.as_str()))
+                                .collect();
+                            let bridge = window.global::<ConnectionBridge>();
+                            bridge.set_ports(ModelRc::from(Rc::new(VecModel::from(port_model))));
+                            bridge.set_port_names(ModelRc::from(Rc::new(VecModel::from(names_model))));
+                        }
+                        BgMsg::TamaData(hunger, happiness, energy, health) => {
+                            let bridge = window.global::<AdvancedBridge>();
+                            bridge.set_tama_hunger(hunger);
+                            bridge.set_tama_happiness(happiness);
+                            bridge.set_tama_energy(energy);
+                            bridge.set_tama_health(health);
+                        }
+                        BgMsg::AutoShiftData(enabled, timeout) => {
+                            let bridge = window.global::<AdvancedBridge>();
+                            bridge.set_autoshift_enabled(enabled);
+                            bridge.set_autoshift_timeout(timeout);
                         }
                     }
                 }

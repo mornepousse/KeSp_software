@@ -4,18 +4,31 @@ import { KeyButton } from "key_button.slint";
 
 export component KeyboardView inherits Rectangle {
     in property <[KeycapData]> keycaps;
+    in property <length> ideal-width: 780px;
+    in property <length> ideal-height: 360px;
     callback key-clicked(int);
 
     background: Theme.bg-surface;
     border-radius: 8px;
-    min-height: 250px;
+    min-height: 150px;
     clip: true;
 
-    // Each keycap is positioned absolutely
+    // Compute scale factor to fit layout in available space (aspect-ratio preserving)
+    property <float> scale-x: (root.width - 20px) / root.ideal-width;
+    property <float> scale-y: (root.height - 20px) / root.ideal-height;
+    property <float> scale: min(root.scale-x, root.scale-y);
+
+    // Center the scaled layout
+    property <length> offset-x: (root.width - root.ideal-width * root.scale) / 2;
+    property <length> offset-y: (root.height - root.ideal-height * root.scale) / 2;
+
     for keycap[idx] in root.keycaps : KeyButton {
-        x: keycap.x;
-        y: keycap.y;
+        x: keycap.x * root.scale + root.offset-x;
+        y: keycap.y * root.scale + root.offset-y;
+        width: keycap.w * root.scale;
+        height: keycap.h * root.scale;
         data: keycap;
+        render-scale: root.scale;
         clicked(key-index) => {
             root.key-clicked(key-index);
         }

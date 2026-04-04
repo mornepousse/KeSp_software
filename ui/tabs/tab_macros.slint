@@ -1,11 +1,453 @@
+import { Button, ScrollView, LineEdit } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
+import { AppState, ConnectionState, MacroBridge } from "../globals.slint";
+
+component QuickKey inherits Rectangle {
+    in property <string> key-label;
+    in property <int> keycode;
+    callback clicked();
+    width: 38px;
+    height: 30px;
+    border-radius: 3px;
+    background: Theme.button-bg;
+
+    Text {
+        text: key-label;
+        color: Theme.fg-primary;
+        font-size: 11px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component StepRow inherits Rectangle {
+    in property <int> step-index;
+    in property <string> action-type;
+    in property <string> label;
+    in property <int> delay-ms;
+    in property <int> keycode;
+    callback remove();
+    callback move-up();
+    callback move-down();
+
+    height: 34px;
+    background: Theme.bg-surface;
+    border-radius: 3px;
+
+    HorizontalLayout {
+        padding: 6px;
+        spacing: 6px;
+
+        // Step number
+        Text {
+            text: "#" + (step-index + 1);
+            color: Theme.fg-secondary;
+            font-size: 10px;
+            width: 28px;
+            vertical-alignment: center;
+        }
+
+        // Action type badge
+        Rectangle {
+            width: 56px;
+            height: 22px;
+            border-radius: 3px;
+            background: action-type == "press" ? #50fa7b40 :
+                        action-type == "release" ? #ff555540 :
+                        action-type == "tap" ? #bd93f940 :
+                        #f1fa8c40;
+            Text {
+                text: action-type;
+                color: action-type == "press" ? Theme.accent-green :
+                       action-type == "release" ? Theme.accent-red :
+                       action-type == "tap" ? Theme.accent-purple :
+                       Theme.accent-yellow;
+                font-size: 10px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Key label or delay value
+        Text {
+            text: action-type == "delay" ? delay-ms + " ms" : label;
+            color: Theme.fg-primary;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+
+        // Move up
+        Rectangle {
+            width: 24px;
+            height: 22px;
+            border-radius: 3px;
+            background: Theme.button-bg;
+            Text {
+                text: "\u{25B2}";
+                color: Theme.fg-secondary;
+                font-size: 10px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.move-up(); } }
+        }
+
+        // Move down
+        Rectangle {
+            width: 24px;
+            height: 22px;
+            border-radius: 3px;
+            background: Theme.button-bg;
+            Text {
+                text: "\u{25BC}";
+                color: Theme.fg-secondary;
+                font-size: 10px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.move-down(); } }
+        }
+
+        // Remove
+        Rectangle {
+            width: 24px;
+            height: 22px;
+            border-radius: 3px;
+            background: #ff555540;
+            Text {
+                text: "\u{2715}";
+                color: Theme.accent-red;
+                font-size: 11px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.remove(); } }
+        }
+    }
+}
 
 export component TabMacros inherits Rectangle {
     background: Theme.bg-primary;
-    Text {
-        text: "Macros (coming soon)";
-        color: Theme.fg-secondary;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+
+    if AppState.connection != ConnectionState.connected : VerticalLayout {
+        alignment: center;
+        Text {
+            text: "Connect to a keyboard first";
+            color: Theme.fg-secondary;
+            font-size: 14px;
+            horizontal-alignment: center;
+        }
+    }
+
+    if AppState.connection == ConnectionState.connected : HorizontalLayout {
+        padding: 8px;
+        spacing: 8px;
+
+        // === LEFT PANEL: Macro list (30%) ===
+        VerticalLayout {
+            width: 30%;
+            spacing: 6px;
+
+            HorizontalLayout {
+                spacing: 6px;
+                Button {
+                    text: "Refresh";
+                    clicked => { MacroBridge.refresh-macros(); }
+                }
+                Button {
+                    text: "+ New";
+                    clicked => { MacroBridge.new-macro(); }
+                }
+            }
+
+            Text {
+                text: "Macros (" + MacroBridge.macros.length + ")";
+                color: Theme.accent-purple;
+                font-size: 13px;
+                font-weight: 700;
+            }
+
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    spacing: 3px;
+
+                    for macro-item in MacroBridge.macros : Rectangle {
+                        height: 44px;
+                        border-radius: 4px;
+                        background: MacroBridge.selected-macro == macro-item.slot
+                            ? Theme.accent-purple : Theme.bg-surface;
+
+                        HorizontalLayout {
+                            padding: 8px;
+                            spacing: 6px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: "M" + macro-item.slot + ": " + macro-item.name;
+                                    color: MacroBridge.selected-macro == macro-item.slot
+                                        ? Theme.bg-primary : Theme.fg-primary;
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: macro-item.steps + " step" + (macro-item.steps != 1 ? "s" : "");
+                                    color: MacroBridge.selected-macro == macro-item.slot
+                                        ? #282a36aa : Theme.fg-secondary;
+                                    font-size: 10px;
+                                }
+                            }
+                        }
+
+                        TouchArea {
+                            clicked => { MacroBridge.select-macro(macro-item.slot); }
+                        }
+                    }
+
+                    if MacroBridge.macros.length == 0 : Text {
+                        text: "No macros. Click Refresh to load.";
+                        color: Theme.fg-secondary;
+                        font-size: 11px;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // === Divider ===
+        Rectangle {
+            width: 1px;
+            background: Theme.bg-secondary;
+        }
+
+        // === RIGHT PANEL: Macro editor (70%) ===
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 8px;
+
+            if MacroBridge.selected-macro < 0 : VerticalLayout {
+                alignment: center;
+                vertical-stretch: 1;
+                Text {
+                    text: "Select a macro to edit, or create a new one";
+                    color: Theme.fg-secondary;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+            }
+
+            if MacroBridge.selected-macro >= 0 : VerticalLayout {
+                spacing: 8px;
+                vertical-stretch: 1;
+
+                // Header with name input
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 32px;
+
+                    Text {
+                        text: "Macro " + MacroBridge.selected-macro;
+                        color: Theme.accent-purple;
+                        font-size: 14px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        width: 80px;
+                    }
+
+                    LineEdit {
+                        text: MacroBridge.macro-name;
+                        placeholder-text: "Macro name";
+                        horizontal-stretch: 1;
+                        edited(val) => { MacroBridge.macro-name = val; }
+                    }
+                }
+
+                // Steps list
+                Text {
+                    text: "Steps (" + MacroBridge.current-steps.length + ")";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 3px;
+
+                        for step[idx] in MacroBridge.current-steps : StepRow {
+                            step-index: idx;
+                            action-type: step.action-type;
+                            label: step.label;
+                            delay-ms: step.delay-ms;
+                            keycode: step.keycode;
+                            remove => { MacroBridge.remove-step(idx); }
+                            move-up => { MacroBridge.move-step-up(idx); }
+                            move-down => { MacroBridge.move-step-down(idx); }
+                        }
+
+                        if MacroBridge.current-steps.length == 0 : Text {
+                            text: "No steps yet. Add keys below.";
+                            color: Theme.fg-secondary;
+                            font-size: 11px;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+
+                // Quick-add section
+                Rectangle {
+                    height: 1px;
+                    background: Theme.bg-secondary;
+                }
+
+                Text {
+                    text: "Add Steps (tap)";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+
+                // Row 1: Letters A-M (HID 4-16)
+                HorizontalLayout {
+                    spacing: 3px;
+                    height: 30px;
+                    QuickKey { key-label: "A"; keycode: 4;  clicked => { MacroBridge.add-step("tap", 4); } }
+                    QuickKey { key-label: "B"; keycode: 5;  clicked => { MacroBridge.add-step("tap", 5); } }
+                    QuickKey { key-label: "C"; keycode: 6;  clicked => { MacroBridge.add-step("tap", 6); } }
+                    QuickKey { key-label: "D"; keycode: 7;  clicked => { MacroBridge.add-step("tap", 7); } }
+                    QuickKey { key-label: "E"; keycode: 8;  clicked => { MacroBridge.add-step("tap", 8); } }
+                    QuickKey { key-label: "F"; keycode: 9;  clicked => { MacroBridge.add-step("tap", 9); } }
+                    QuickKey { key-label: "G"; keycode: 10; clicked => { MacroBridge.add-step("tap", 10); } }
+                    QuickKey { key-label: "H"; keycode: 11; clicked => { MacroBridge.add-step("tap", 11); } }
+                    QuickKey { key-label: "I"; keycode: 12; clicked => { MacroBridge.add-step("tap", 12); } }
+                    QuickKey { key-label: "J"; keycode: 13; clicked => { MacroBridge.add-step("tap", 13); } }
+                    QuickKey { key-label: "K"; keycode: 14; clicked => { MacroBridge.add-step("tap", 14); } }
+                    QuickKey { key-label: "L"; keycode: 15; clicked => { MacroBridge.add-step("tap", 15); } }
+                    QuickKey { key-label: "M"; keycode: 16; clicked => { MacroBridge.add-step("tap", 16); } }
+                }
+
+                // Row 2: Letters N-Z (HID 17-29)
+                HorizontalLayout {
+                    spacing: 3px;
+                    height: 30px;
+                    QuickKey { key-label: "N"; keycode: 17; clicked => { MacroBridge.add-step("tap", 17); } }
+                    QuickKey { key-label: "O"; keycode: 18; clicked => { MacroBridge.add-step("tap", 18); } }
+                    QuickKey { key-label: "P"; keycode: 19; clicked => { MacroBridge.add-step("tap", 19); } }
+                    QuickKey { key-label: "Q"; keycode: 20; clicked => { MacroBridge.add-step("tap", 20); } }
+                    QuickKey { key-label: "R"; keycode: 21; clicked => { MacroBridge.add-step("tap", 21); } }
+                    QuickKey { key-label: "S"; keycode: 22; clicked => { MacroBridge.add-step("tap", 22); } }
+                    QuickKey { key-label: "T"; keycode: 23; clicked => { MacroBridge.add-step("tap", 23); } }
+                    QuickKey { key-label: "U"; keycode: 24; clicked => { MacroBridge.add-step("tap", 24); } }
+                    QuickKey { key-label: "V"; keycode: 25; clicked => { MacroBridge.add-step("tap", 25); } }
+                    QuickKey { key-label: "W"; keycode: 26; clicked => { MacroBridge.add-step("tap", 26); } }
+                    QuickKey { key-label: "X"; keycode: 27; clicked => { MacroBridge.add-step("tap", 27); } }
+                    QuickKey { key-label: "Y"; keycode: 28; clicked => { MacroBridge.add-step("tap", 28); } }
+                    QuickKey { key-label: "Z"; keycode: 29; clicked => { MacroBridge.add-step("tap", 29); } }
+                }
+
+                // Row 3: Special keys
+                HorizontalLayout {
+                    spacing: 3px;
+                    height: 30px;
+                    QuickKey { key-label: "Ent";  keycode: 40; width: 42px; clicked => { MacroBridge.add-step("tap", 40); } }
+                    QuickKey { key-label: "Esc";  keycode: 41; width: 42px; clicked => { MacroBridge.add-step("tap", 41); } }
+                    QuickKey { key-label: "Bksp"; keycode: 42; width: 48px; clicked => { MacroBridge.add-step("tap", 42); } }
+                    QuickKey { key-label: "Tab";  keycode: 43; width: 42px; clicked => { MacroBridge.add-step("tap", 43); } }
+                    QuickKey { key-label: "Spc";  keycode: 44; width: 42px; clicked => { MacroBridge.add-step("tap", 44); } }
+                    QuickKey { key-label: "Del";  keycode: 76; width: 42px; clicked => { MacroBridge.add-step("tap", 76); } }
+                }
+
+                // Row 4: Modifiers as press/release (for chorded macros)
+                Text {
+                    text: "Modifiers (press/release)";
+                    color: Theme.fg-secondary;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+
+                HorizontalLayout {
+                    spacing: 3px;
+                    height: 30px;
+                    QuickKey { key-label: "+Ctrl"; keycode: 224; width: 50px; clicked => { MacroBridge.add-step("press", 224); } }
+                    QuickKey { key-label: "-Ctrl"; keycode: 224; width: 50px; clicked => { MacroBridge.add-step("release", 224); } }
+                    QuickKey { key-label: "+Shft"; keycode: 225; width: 50px; clicked => { MacroBridge.add-step("press", 225); } }
+                    QuickKey { key-label: "-Shft"; keycode: 225; width: 50px; clicked => { MacroBridge.add-step("release", 225); } }
+                    QuickKey { key-label: "+Alt";  keycode: 226; width: 50px; clicked => { MacroBridge.add-step("press", 226); } }
+                    QuickKey { key-label: "-Alt";  keycode: 226; width: 50px; clicked => { MacroBridge.add-step("release", 226); } }
+                    QuickKey { key-label: "+GUI";  keycode: 227; width: 50px; clicked => { MacroBridge.add-step("press", 227); } }
+                    QuickKey { key-label: "-GUI";  keycode: 227; width: 50px; clicked => { MacroBridge.add-step("release", 227); } }
+                }
+
+                // Delay row
+                HorizontalLayout {
+                    spacing: 6px;
+                    height: 32px;
+
+                    Text {
+                        text: "Delay:";
+                        color: Theme.fg-secondary;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+
+                    LineEdit {
+                        text: MacroBridge.delay-input;
+                        placeholder-text: "ms";
+                        width: 70px;
+                        edited(val) => { MacroBridge.delay-input = val; }
+                    }
+
+                    Text {
+                        text: "ms";
+                        color: Theme.fg-secondary;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+
+                    Button {
+                        text: "+ Delay";
+                        clicked => {
+                            MacroBridge.add-step("delay", 0);
+                        }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                // Save / Delete buttons
+                Rectangle {
+                    height: 1px;
+                    background: Theme.bg-secondary;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 36px;
+
+                    Button {
+                        text: "Save Macro";
+                        clicked => { MacroBridge.save-macro(); }
+                    }
+
+                    Button {
+                        text: "Delete Macro";
+                        clicked => { MacroBridge.delete-macro(MacroBridge.selected-macro); }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+        }
     }
 }

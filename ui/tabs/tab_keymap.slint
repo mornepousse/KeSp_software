@@ -1,98 +1,128 @@
-import { Button, ComboBox } from "std-widgets.slint";
+import { Button, LineEdit } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
-import { KeymapBridge, AppState, KeySelectorBridge, ModalKind } from "../globals.slint";
+import { KeymapBridge, AppState, KeySelectorBridge, ModalKind, ConnectionState } from "../globals.slint";
 import { KeyboardView } from "../components/keyboard_view.slint";
 
 export component TabKeymap inherits VerticalLayout {
-    padding: 12px;
-    spacing: 8px;
+    padding: 8px;
+    spacing: 4px;
 
-    // Layer bar
+    // Layer bar (scrollable if too many items)
     HorizontalLayout {
-        spacing: 8px;
+        spacing: 4px;
         alignment: start;
 
         Text {
             text: "Layer:";
             color: Theme.fg-primary;
             vertical-alignment: center;
+            font-size: 12px;
         }
 
         for layer[idx] in KeymapBridge.layers : Rectangle {
-            width: 80px;
-            height: 32px;
+            min-width: 60px;
+            max-width: 90px;
+            height: 28px;
             border-radius: 4px;
-            background: layer.active ? Theme.accent-purple : Theme.button-bg;
+            background: KeymapBridge.active-layer == layer.index ? Theme.accent-purple : Theme.button-bg;
 
             Text {
                 text: layer.name;
                 color: Theme.fg-primary;
+                font-size: 11px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
+                overflow: elide;
             }
 
             TouchArea {
                 clicked => { KeymapBridge.switch-layer(layer.index); }
-                mouse-cursor: pointer;
             }
         }
 
         Rectangle { horizontal-stretch: 1; }
 
-        // Heatmap toggle
+        // Compact buttons row
         Rectangle {
-            width: 100px;
-            height: 32px;
+            min-width: 55px;
+            height: 28px;
+            border-radius: 4px;
+            background: Theme.button-bg;
+            Text { text: "Export"; color: Theme.fg-primary; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea { clicked => { KeymapBridge.export-keymap(); } }
+        }
+        Rectangle {
+            min-width: 55px;
+            height: 28px;
+            border-radius: 4px;
+            background: Theme.button-bg;
+            Text { text: "Import"; color: Theme.fg-primary; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea { clicked => { KeymapBridge.import-keymap(); } }
+        }
+        Rectangle {
+            min-width: 70px;
+            height: 28px;
             border-radius: 4px;
             background: KeymapBridge.heatmap-enabled ? Theme.accent-orange : Theme.button-bg;
-
-            Text {
-                text: "Heatmap";
-                color: Theme.fg-primary;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-
+            Text { text: "Heatmap"; color: Theme.fg-primary; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
             TouchArea {
-                clicked => { KeymapBridge.heatmap-enabled = !KeymapBridge.heatmap-enabled; }
-                mouse-cursor: pointer;
+                clicked => {
+                    KeymapBridge.heatmap-enabled = !KeymapBridge.heatmap-enabled;
+                    KeymapBridge.toggle-heatmap(KeymapBridge.heatmap-enabled);
+                }
             }
         }
     }
 
-    // Keyboard view (main area)
+    // Keyboard view (main area) — click a key opens the selector directly
     KeyboardView {
         vertical-stretch: 1;
         keycaps: KeymapBridge.keycaps;
+        ideal-width: KeymapBridge.layout-width;
+        ideal-height: KeymapBridge.layout-height;
         key-clicked(idx) => {
             KeymapBridge.select-key(idx);
+            // Open key selector immediately (no "Change Key..." step)
+            KeySelectorBridge.editing-key-index = idx;
+            KeySelectorBridge.active-modal = ModalKind.key-selector;
         }
     }
 
-    // Selected key info bar
-    if KeymapBridge.selected-key-index >= 0 : Rectangle {
-        height: 40px;
-        background: Theme.bg-secondary;
-        border-radius: 4px;
+    // Selected key info bar + layer rename (compact)
+    HorizontalLayout {
+        height: 30px;
+        spacing: 8px;
 
-        HorizontalLayout {
-            padding: 8px;
-            spacing: 12px;
+        if KeymapBridge.selected-key-index >= 0 : Text {
+            text: "Key: " + KeymapBridge.selected-key-label;
+            color: Theme.accent-cyan;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
 
-            Text {
-                text: "Selected: " + KeymapBridge.selected-key-label;
-                color: Theme.accent-cyan;
-                vertical-alignment: center;
-            }
+        Rectangle { horizontal-stretch: 1; }
 
-            Rectangle { horizontal-stretch: 1; }
-
-            Button {
-                text: "Change Key...";
-                clicked => {
-                    KeySelectorBridge.editing-key-index = KeymapBridge.selected-key-index;
-                    KeySelectorBridge.active-modal = ModalKind.key-selector;
-                }
+        Text {
+            text: "Rename:";
+            color: Theme.fg-secondary;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+        LineEdit {
+            min-width: 100px;
+            max-width: 160px;
+            horizontal-stretch: 1;
+            text <=> KeymapBridge.rename-text;
+            placeholder-text: "Layer name";
+        }
+        Rectangle {
+            min-width: 60px;
+            height: 28px;
+            border-radius: 4px;
+            background: Theme.accent-purple;
+            Text { text: "Rename"; color: Theme.fg-primary; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                clicked => { KeymapBridge.rename-layer(KeymapBridge.active-layer, KeymapBridge.rename-text); }
             }
         }
     }

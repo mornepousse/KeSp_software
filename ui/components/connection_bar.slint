@@ -22,11 +22,25 @@ export component ConnectionBar inherits Rectangle {
             }
         }
 
-        // Port selector (placeholder - ComboBox needs string model)
-        Text {
-            text: ConnectionBridge.selected-port != "" ? ConnectionBridge.selected-port : "No port selected";
-            color: Theme.fg-primary;
-            vertical-alignment: center;
+        // Port selector ComboBox
+        ComboBox {
+            width: 220px;
+            model: ConnectionBridge.port-names;
+            current-index <=> ConnectionBridge.selected-port-index;
+            enabled: AppState.connection != ConnectionState.connected;
+            selected(value) => {
+                ConnectionBridge.selected-port = value;
+            }
+        }
+
+        // Refresh ports button
+        Button {
+            text: "\u{21BB}";
+            width: 36px;
+            enabled: AppState.connection != ConnectionState.connected;
+            clicked => {
+                ConnectionBridge.refresh-ports();
+            }
         }
 
         // Connect/Disconnect button

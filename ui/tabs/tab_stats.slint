@@ -35,6 +35,8 @@ export component TabStats inherits VerticalLayout {
     KeyboardView {
         vertical-stretch: 1;
         keycaps: StatsBridge.heatmap-keycaps;
+        ideal-width: StatsBridge.layout-width;
+        ideal-height: StatsBridge.layout-height;
         key-clicked(idx) => { }
     }
 

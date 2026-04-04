@@ -37,11 +37,15 @@ export global AppState {
     in-out property <bool> spinner-visible: false;
     in-out property <string> firmware-version: "";
     in-out property <int> wpm: 0;
+    in-out property <string> notification-text: "";
+    in-out property <bool> notification-visible: false;
 }
 
 export global ConnectionBridge {
     in property <[PortInfo]> ports;
+    in property <[string]> port-names;
     in-out property <string> selected-port: "";
+    in-out property <int> selected-port-index: -1;
     callback connect();
     callback disconnect();
     callback refresh-ports();
@@ -50,13 +54,20 @@ export global ConnectionBridge {
 export global KeymapBridge {
     in property <[KeycapData]> keycaps;
     in property <[LayerInfo]> layers;
+    in property <length> layout-width: 780px;
+    in property <length> layout-height: 360px;
     in-out property <int> selected-key-index: -1;
     in-out property <int> active-layer: 0;
     in-out property <string> selected-key-label: "";
     in-out property <bool> heatmap-enabled: false;
+    in-out property <string> rename-text: "";
     callback select-key(int);
     callback switch-layer(int);
     callback change-key(int, int); // key-index, new-keycode
+    callback toggle-heatmap(bool);
+    callback export-keymap();
+    callback import-keymap();
+    callback rename-layer(int, string); // layer_index, new_name
 }
 
 export struct KeycodeEntry {
@@ -91,6 +102,8 @@ export global KeySelectorBridge {
 
 export global StatsBridge {
     in property <[KeycapData]> heatmap-keycaps;
+    in property <length> layout-width: 780px;
+    in property <length> layout-height: 360px;
     in-out property <bool> heatmap-active: false;
     in property <string> stats-summary: "";
     in property <int> total-keypresses: 0;
@@ -122,9 +135,37 @@ export struct ComboEntry {
     result-code: int,
 }
 
+export struct LeaderEntry {
+    index: int,
+    sequence: string,   // "A -> B -> C"
+    result: string,     // decoded keycode + mod
+    result-code: int,
+    result-mod: int,
+}
+
+export struct KeyOverrideEntry {
+    index: int,
+    trigger-key: string,
+    trigger-mod: string,
+    result-key: string,
+    result-mod: string,
+}
+
+export struct BtSlotInfo {
+    index: int,
+    status: string,     // "Connected", "Paired", "Empty"
+    name: string,
+    addr: string,
+}
+
 export global AdvancedBridge {
     in property <[TapDanceSlot]> tap-dance-slots;
     in property <[ComboEntry]> combos;
+    in property <[LeaderEntry]> leaders;
+    in property <[KeyOverrideEntry]> key-overrides;
+    in property <[BtSlotInfo]> bt-slots;
+    in property <string> bt-mode: "USB";
+    in property <int> bt-active-slot: 0;
     in-out property <bool> show-tap-dance: true;
     in-out property <bool> show-combos: true;
     in-out property <bool> show-leader: false;
@@ -133,6 +174,68 @@ export global AdvancedBridge {
     callback refresh-all();
     callback save-td(int);
     callback delete-combo(int);
+    callback delete-leader(int);
+    callback delete-ko(int);
+    callback bt-next();
+    callback bt-prev();
+    callback bt-pair();
+    callback bt-disconnect();
+    callback bt-toggle-usb-bt();
+
+    // Auto Shift
+    in-out property <bool> autoshift-enabled: false;
+    in-out property <int> autoshift-timeout: 200;
+    in-out property <bool> show-autoshift: false;
+    callback save-autoshift();
+
+    // Tri-Layer
+    in-out property <int> tri-layer1: 1;
+    in-out property <int> tri-layer2: 2;
+    in-out property <int> tri-layer3: 3;
+    in-out property <bool> show-tri-layer: false;
+    callback save-tri-layer();
+
+    // Tamagotchi
+    in-out property <bool> show-tamagotchi: false;
+    in property <int> tama-hunger: 0;
+    in property <int> tama-happiness: 0;
+    in property <int> tama-energy: 0;
+    in property <int> tama-health: 0;
+    callback tama-feed();
+    callback tama-play();
+    callback tama-sleep();
+    callback tama-meds();
+    callback refresh-tama();
+}
+
+export struct MacroStepInfo {
+    action-type: string,  // "press", "release", "tap", "delay"
+    keycode: int,
+    label: string,        // decoded display name (key name or delay ms)
+    delay-ms: int,
+}
+
+export struct MacroInfo {
+    slot: int,
+    name: string,
+    steps: int,  // number of steps
+}
+
+export global MacroBridge {
+    in property <[MacroInfo]> macros;
+    in property <[MacroStepInfo]> current-steps;
+    in-out property <int> selected-macro: -1;
+    in-out property <string> macro-name: "";
+    in-out property <string> delay-input: "50";
+    callback refresh-macros();
+    callback select-macro(int);
+    callback save-macro();
+    callback delete-macro(int);
+    callback add-step(string, int);    // action-type, keycode-or-delay
+    callback remove-step(int);         // step index
+    callback move-step-up(int);        // step index
+    callback move-step-down(int);      // step index
+    callback new-macro();              // create a new empty macro
 }
 
 export global SettingsBridge {

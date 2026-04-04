@@ -41,6 +41,26 @@ impl SerialManager {
         names
     }
 
+    /// List ports with descriptive names: returns (display_name, path) pairs.
+    /// USB ports show product name if available, others show type.
+    pub fn list_ports_detailed() -> Vec<(String, String)> {
+        let available = serialport::available_ports();
+        let ports = available.unwrap_or_default();
+        ports
+            .into_iter()
+            .map(|p| {
+                let display = match &p.port_type {
+                    serialport::SerialPortType::UsbPort(usb) => {
+                        let product = usb.product.as_deref().unwrap_or("USB");
+                        format!("{} ({})", p.port_name, product)
+                    }
+                    _ => p.port_name.clone(),
+                };
+                (display, p.port_name)
+            })
+            .collect()
+    }
+
     pub fn connect(&mut self, port_name: &str) -> Result<(), String> {
         let builder = serialport::new(port_name, BAUD_RATE);
         let builder_with_timeout = builder.timeout(Duration::from_millis(CONNECT_TIMEOUT_MS));
@@ -500,6 +520,28 @@ impl SerialManager {
         let cmd = format!("SETKEY {} {} {} {}", layer, row, col, keycode);
         self.send_command(&cmd)?;
         Ok(())
+    }
+
+    /// Query the current WPM from the keyboard firmware.
+    pub fn get_wpm(&mut self) -> Result<u16, String> {
+        if self.v2 {
+            let resp = self.send_binary(bp::cmd::WPM_QUERY, &[])?;
+            if resp.payload.len() >= 2 {
+                let wpm = u16::from_le_bytes([resp.payload[0], resp.payload[1]]);
+                return Ok(wpm);
+            }
+            return Ok(0);
+        }
+
+        // Legacy fallback
+        let lines = self.query_command("WPM?")?;
+        if let Some(first) = lines.first() {
+            // Parse first line: might be "WPM: 42" or just "42"
+            let num_str = first.trim_start_matches("WPM:").trim();
+            let wpm = num_str.parse::<u16>().unwrap_or(0);
+            return Ok(wpm);
+        }
+        Ok(0)
     }
 
     pub fn get_layout_json(&mut self) -> Result<String, String> {
