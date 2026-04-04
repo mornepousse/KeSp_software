@@ -184,7 +184,19 @@ enum BgMsg {
     Disconnected,
     TapDanceData(Vec<[u16; 4]>),
     ComboData(Vec<logic::parsers::ComboEntry>),
+    StatsData(Vec<Vec<u32>>, u32), // heatmap data, max_value
     StatusMsg(String),
+    OtaProgress(f32, String),
+    FlashProgress(f32, String),
+}
+
+/// Interpolate a heatmap color from cold (blue) to hot (red).
+/// value is 0.0..1.0
+fn heatmap_color(value: f32) -> slint::Color {
+    let r = (value * 255.0).min(255.0) as u8;
+    let g = ((1.0 - (value - 0.5).abs() * 2.0) * 255.0).max(0.0) as u8;
+    let b = ((1.0 - value) * 255.0).min(255.0) as u8;
+    slint::Color::from_argb_u8(255, r, g, b)
 }
 
 fn build_keycap_model(keys: &[KeycapPos]) -> Rc<VecModel<KeycapData>> {
@@ -275,7 +287,13 @@ fn main() {
     // Current state
     let current_keymap: Rc<std::cell::RefCell<Vec<Vec<u16>>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
     let current_layer: Rc<std::cell::Cell<usize>> = Rc::new(std::cell::Cell::new(0));
-    let keyboard_layout = Rc::new(logic::layout_remap::KeyboardLayout::from_name("QWERTY"));
+    let saved_settings = logic::settings::load();
+    let keyboard_layout: Rc<std::cell::RefCell<logic::layout_remap::KeyboardLayout>> =
+        Rc::new(std::cell::RefCell::new(logic::layout_remap::KeyboardLayout::from_name(&saved_settings.keyboard_layout)));
+
+    // OTA / Flash file paths (shared with callbacks, need Arc<Mutex> for thread safety)
+    let ota_firmware_path: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let flash_firmware_path: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
     // --- Key selector setup ---
     let all_keycode_entries = build_keycode_entries();
@@ -342,7 +360,8 @@ fn main() {
             // Update keycap label
             {
                 let decoded = keycode::decode_keycode(code as u16);
-                let remapped = logic::layout_remap::remap_key_label(&keyboard_layout, &decoded);
+                let layout = keyboard_layout.borrow();
+                let remapped = logic::layout_remap::remap_key_label(&layout, &decoded);
                 let label = remapped.unwrap_or(&decoded).to_string();
                 let mut item = keycap_model.row_data(idx).unwrap();
                 item.keycode = code;
@@ -446,6 +465,117 @@ fn main() {
                 let hex_str = hex_str.trim().trim_start_matches("0x").trim_start_matches("0X");
                 if let Ok(code) = u16::from_str_radix(hex_str, 16) {
                     ks.invoke_select_keycode(code as i32);
+                }
+            }
+        });
+    }
+
+    // --- StatsBridge: refresh-stats ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        let window_weak = window.as_weak();
+        window.global::<StatsBridge>().on_refresh_stats(move || {
+            if let Some(w) = window_weak.upgrade() {
+                w.global::<AppState>().set_status_text("Loading key statistics...".into());
+            }
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut ser = serial.lock().unwrap();
+                if ser.v2 {
+                    match ser.send_binary(logic::binary_protocol::cmd::KEYSTATS_BIN, &[]) {
+                        Ok(resp) => {
+                            let (data, max_val) = logic::parsers::parse_keystats_binary(&resp.payload);
+                            let _ = tx.send(BgMsg::StatsData(data, max_val));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Stats error: {}", e))); }
+                    }
+                } else {
+                    match ser.query_command(logic::protocol::CMD_KEYSTATS) {
+                        Ok(lines) => {
+                            let (data, max_val) = logic::parsers::parse_heatmap_lines(&lines);
+                            let _ = tx.send(BgMsg::StatsData(data, max_val));
+                        }
+                        Err(e) => { let _ = tx.send(BgMsg::StatusMsg(format!("Stats error: {}", e))); }
+                    }
+                }
+            });
+        });
+    }
+
+    // --- StatsBridge: export-csv ---
+    {
+        let window_weak = window.as_weak();
+        let keys_arc = keys_arc.clone();
+        let current_keymap = current_keymap.clone();
+        window.global::<StatsBridge>().on_export_csv(move || {
+            let window_weak = window_weak.clone();
+            let keys_arc = keys_arc.clone();
+            let current_keymap = current_keymap.clone();
+
+            // Read the current heatmap keycaps from the bridge to get labels + colors
+            let heatmap_keycaps = if let Some(w) = window_weak.upgrade() {
+                let bridge = w.global::<StatsBridge>();
+                let model = bridge.get_heatmap_keycaps();
+                let count = model.row_count();
+                let mut items = Vec::with_capacity(count);
+                for i in 0..count {
+                    items.push(model.row_data(i).unwrap());
+                }
+                items
+            } else {
+                return;
+            };
+
+            if heatmap_keycaps.is_empty() {
+                if let Some(w) = window_weak.upgrade() {
+                    w.global::<AppState>().set_status_text("No stats data. Click Refresh Stats first.".into());
+                }
+                return;
+            }
+
+            // Pick save path
+            let dialog = rfd::FileDialog::new()
+                .set_title("Export Key Statistics CSV")
+                .add_filter("CSV", &["csv"])
+                .set_file_name("keystats.csv");
+
+            if let Some(path) = dialog.save_file() {
+                let km = current_keymap.borrow();
+                let mut csv = String::from("Row,Col,Label,Keycode,Presses\n");
+                for (i, kp) in keys_arc.iter().enumerate() {
+                    let row = kp.row as usize;
+                    let col = kp.col as usize;
+                    let label = if i < heatmap_keycaps.len() {
+                        heatmap_keycaps[i].label.to_string()
+                    } else {
+                        String::new()
+                    };
+                    let code = km.get(row).and_then(|r| r.get(col)).copied().unwrap_or(0);
+                    let sublabel = if i < heatmap_keycaps.len() {
+                        heatmap_keycaps[i].sublabel.to_string()
+                    } else {
+                        "0".to_string()
+                    };
+                    // sublabel stores the press count as a string in heatmap mode
+                    csv.push_str(&format!("{},{},{},0x{:04X},{}\n", row, col, label, code, sublabel));
+                }
+                match std::fs::write(&path, &csv) {
+                    Ok(_) => {
+                        if let Some(w) = window_weak.upgrade() {
+                            w.global::<AppState>().set_status_text(
+                                SharedString::from(format!("Exported to {}", path.display()))
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(w) = window_weak.upgrade() {
+                            w.global::<AppState>().set_status_text(
+                                SharedString::from(format!("Export error: {}", e))
+                            );
+                        }
+                    }
                 }
             }
         });
@@ -704,6 +834,400 @@ fn main() {
         });
     }
 
+    // --- SettingsBridge setup ---
+    {
+        // Populate available layouts
+        let layout_names: Vec<SharedString> = logic::layout_remap::KeyboardLayout::all()
+            .iter()
+            .map(|l| SharedString::from(l.name()))
+            .collect();
+        let layout_model = Rc::new(VecModel::from(layout_names));
+        window.global::<SettingsBridge>().set_available_layouts(ModelRc::from(layout_model));
+
+        // Set initial selection to match saved setting
+        let saved_layout_name = saved_settings.keyboard_layout.to_ascii_uppercase();
+        let initial_idx = logic::layout_remap::KeyboardLayout::all()
+            .iter()
+            .position(|l| l.name() == saved_layout_name)
+            .unwrap_or(0);
+        window.global::<SettingsBridge>().set_selected_layout_index(initial_idx as i32);
+
+        // Populate programming ports
+        let prog_ports: Vec<SharedString> = SerialManager::list_ports()
+            .into_iter()
+            .map(|p| SharedString::from(p))
+            .collect();
+        let prog_ports_model = Rc::new(VecModel::from(prog_ports));
+        window.global::<SettingsBridge>().set_prog_ports(ModelRc::from(prog_ports_model));
+    }
+
+    // --- SettingsBridge: change-layout ---
+    {
+        let keyboard_layout = keyboard_layout.clone();
+        let keycap_model = keycap_model.clone();
+        let keys_arc = keys_arc.clone();
+        let current_keymap = current_keymap.clone();
+        let window_weak = window.as_weak();
+        window.global::<SettingsBridge>().on_change_layout(move |idx| {
+            let all = logic::layout_remap::KeyboardLayout::all();
+            let idx = idx as usize;
+            if idx >= all.len() { return; }
+            let new_layout = all[idx];
+            *keyboard_layout.borrow_mut() = new_layout;
+
+            // Save to settings
+            let mut settings = logic::settings::load();
+            settings.keyboard_layout = new_layout.name().to_string();
+            logic::settings::save(&settings);
+
+            // Re-render keycap labels with new layout
+            let km = current_keymap.borrow();
+            if !km.is_empty() {
+                update_keycap_labels(&keycap_model, &keys_arc, &km, &new_layout);
+            }
+
+            if let Some(w) = window_weak.upgrade() {
+                w.global::<AppState>().set_status_text(
+                    SharedString::from(format!("Layout: {}", new_layout.name()))
+                );
+            }
+        });
+    }
+
+    // --- SettingsBridge: backup ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<SettingsBridge>().on_backup(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                // Read all layer keymaps from the keyboard
+                let mut ser = serial.lock().unwrap();
+                if !ser.connected {
+                    let _ = tx.send(BgMsg::StatusMsg("Not connected".into()));
+                    return;
+                }
+
+                let layer_names = ser.get_layer_names().unwrap_or_default();
+                let num_layers = layer_names.len().max(1);
+                let mut keymaps = Vec::new();
+                for l in 0..num_layers {
+                    match ser.get_keymap(l as u8) {
+                        Ok(km) => keymaps.push(km),
+                        Err(e) => {
+                            let _ = tx.send(BgMsg::StatusMsg(format!("Backup error (layer {}): {}", l, e)));
+                            return;
+                        }
+                    }
+                }
+                drop(ser); // release lock before file dialog
+
+                let backup = serde_json::json!({
+                    "layer_names": layer_names,
+                    "keymaps": keymaps,
+                });
+                let json = serde_json::to_string_pretty(&backup).unwrap_or_default();
+
+                let save_dialog = rfd::FileDialog::new()
+                    .set_title("Save Backup")
+                    .add_filter("JSON", &["json"])
+                    .set_file_name("kase_backup.json")
+                    .save_file();
+
+                match save_dialog {
+                    Some(path) => {
+                        match std::fs::write(&path, &json) {
+                            Ok(_) => {
+                                let _ = tx.send(BgMsg::StatusMsg(format!("Backup saved to {}", path.display())));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(BgMsg::StatusMsg(format!("Backup write error: {}", e)));
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = tx.send(BgMsg::StatusMsg("Backup cancelled".into()));
+                    }
+                }
+            });
+        });
+    }
+
+    // --- SettingsBridge: restore ---
+    {
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        window.global::<SettingsBridge>().on_restore(move || {
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let open_dialog = rfd::FileDialog::new()
+                    .set_title("Restore Backup")
+                    .add_filter("JSON", &["json"])
+                    .pick_file();
+
+                let path = match open_dialog {
+                    Some(p) => p,
+                    None => {
+                        let _ = tx.send(BgMsg::StatusMsg("Restore cancelled".into()));
+                        return;
+                    }
+                };
+
+                let contents = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(BgMsg::StatusMsg(format!("Read error: {}", e)));
+                        return;
+                    }
+                };
+
+                let parsed: serde_json::Value = match serde_json::from_str(&contents) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx.send(BgMsg::StatusMsg(format!("JSON parse error: {}", e)));
+                        return;
+                    }
+                };
+
+                let keymaps = match parsed.get("keymaps").and_then(|v| v.as_array()) {
+                    Some(arr) => arr,
+                    None => {
+                        let _ = tx.send(BgMsg::StatusMsg("Invalid backup: missing keymaps".into()));
+                        return;
+                    }
+                };
+
+                let mut ser = serial.lock().unwrap();
+                if !ser.connected {
+                    let _ = tx.send(BgMsg::StatusMsg("Not connected".into()));
+                    return;
+                }
+
+                for (layer_idx, layer_val) in keymaps.iter().enumerate() {
+                    let rows = match layer_val.as_array() {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    for (row_idx, row_val) in rows.iter().enumerate() {
+                        let cols = match row_val.as_array() {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        for (col_idx, code_val) in cols.iter().enumerate() {
+                            let code = code_val.as_u64().unwrap_or(0) as u16;
+                            if let Err(e) = ser.set_key(layer_idx as u8, row_idx as u8, col_idx as u8, code) {
+                                let _ = tx.send(BgMsg::StatusMsg(format!("Restore error at L{}R{}C{}: {}", layer_idx, row_idx, col_idx, e)));
+                                return;
+                            }
+                        }
+                    }
+                    let _ = tx.send(BgMsg::StatusMsg(format!("Restored layer {}/{}", layer_idx + 1, keymaps.len())));
+                }
+
+                // Reload layer 0 keymap
+                match ser.get_keymap(0) {
+                    Ok(km) => { let _ = tx.send(BgMsg::Keymap(km)); }
+                    Err(_) => {}
+                }
+                let _ = tx.send(BgMsg::StatusMsg("Restore complete".into()));
+            });
+        });
+    }
+
+    // --- SettingsBridge: OTA select file ---
+    {
+        let ota_firmware_path = ota_firmware_path.clone();
+        let window_weak = window.as_weak();
+        window.global::<SettingsBridge>().on_ota_select_file(move || {
+            let ota_firmware_path = ota_firmware_path.clone();
+            let window_weak = window_weak.clone();
+            std::thread::spawn(move || {
+                let dialog = rfd::FileDialog::new()
+                    .set_title("Select OTA Firmware")
+                    .add_filter("Binary", &["bin"])
+                    .pick_file();
+
+                if let Some(path) = dialog {
+                    let display = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    *ota_firmware_path.lock().unwrap() = path.display().to_string();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(w) = window_weak.upgrade() {
+                            w.global::<SettingsBridge>().set_ota_file_name(SharedString::from(&display));
+                        }
+                    });
+                }
+            });
+        });
+    }
+
+    // --- SettingsBridge: OTA start ---
+    {
+        let ota_firmware_path = ota_firmware_path.clone();
+        let serial = serial.clone();
+        let tx = bg_tx.clone();
+        let window_weak = window.as_weak();
+        window.global::<SettingsBridge>().on_ota_start(move || {
+            let fw_path = ota_firmware_path.lock().unwrap().clone();
+            if fw_path.is_empty() { return; }
+
+            if let Some(w) = window_weak.upgrade() {
+                w.global::<SettingsBridge>().set_ota_in_progress(true);
+                w.global::<SettingsBridge>().set_ota_progress(0.0);
+                w.global::<SettingsBridge>().set_ota_status(SharedString::from("Reading firmware file..."));
+            }
+
+            let serial = serial.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let firmware = match std::fs::read(&fw_path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        let _ = tx.send(BgMsg::OtaProgress(0.0, format!("File read error: {}", e)));
+                        return;
+                    }
+                };
+
+                let _ = tx.send(BgMsg::OtaProgress(0.02, format!("Firmware: {} KB", firmware.len() / 1024)));
+
+                let mut ser = serial.lock().unwrap();
+                if !ser.connected || !ser.v2 {
+                    let _ = tx.send(BgMsg::OtaProgress(0.0, "Not connected (v2 required for OTA)".into()));
+                    return;
+                }
+
+                // Send OTA_START with firmware size
+                let size = firmware.len() as u32;
+                let size_payload = size.to_le_bytes().to_vec();
+                match ser.send_binary(logic::binary_protocol::cmd::OTA_START, &size_payload) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = tx.send(BgMsg::OtaProgress(0.0, format!("OTA start error: {}", e)));
+                        return;
+                    }
+                }
+
+                let _ = tx.send(BgMsg::OtaProgress(0.05, "OTA started, sending data...".into()));
+
+                // Send data in 512-byte chunks
+                let chunk_size = 512;
+                let total_chunks = (firmware.len() + chunk_size - 1) / chunk_size;
+                for (i, chunk) in firmware.chunks(chunk_size).enumerate() {
+                    match ser.send_binary(logic::binary_protocol::cmd::OTA_DATA, chunk) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            let _ = ser.send_binary(logic::binary_protocol::cmd::OTA_ABORT, &[]);
+                            let _ = tx.send(BgMsg::OtaProgress(0.0, format!("OTA data error at chunk {}: {}", i, e)));
+                            return;
+                        }
+                    }
+                    let progress = 0.05 + 0.90 * ((i + 1) as f32 / total_chunks as f32);
+                    if (i + 1) % 20 == 0 || i + 1 == total_chunks {
+                        let _ = tx.send(BgMsg::OtaProgress(
+                            progress,
+                            format!("Sending {}/{} ({} KB / {} KB)", i + 1, total_chunks, ((i + 1) * chunk_size).min(firmware.len()) / 1024, firmware.len() / 1024),
+                        ));
+                    }
+                }
+
+                let _ = tx.send(BgMsg::OtaProgress(1.0, "OTA complete — device will reboot".into()));
+            });
+        });
+    }
+
+    // --- SettingsBridge: flash select file ---
+    {
+        let flash_firmware_path = flash_firmware_path.clone();
+        let window_weak = window.as_weak();
+        window.global::<SettingsBridge>().on_flash_select_file(move || {
+            let flash_firmware_path = flash_firmware_path.clone();
+            let window_weak = window_weak.clone();
+            std::thread::spawn(move || {
+                let dialog = rfd::FileDialog::new()
+                    .set_title("Select ESP32 Firmware")
+                    .add_filter("Binary", &["bin"])
+                    .pick_file();
+
+                if let Some(path) = dialog {
+                    let display = path.display().to_string();
+                    *flash_firmware_path.lock().unwrap() = display.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(w) = window_weak.upgrade() {
+                            w.global::<SettingsBridge>().set_prog_path(SharedString::from(&display));
+                        }
+                    });
+                }
+            });
+        });
+    }
+
+    // --- SettingsBridge: flash start ---
+    {
+        let flash_firmware_path = flash_firmware_path.clone();
+        let tx = bg_tx.clone();
+        let window_weak = window.as_weak();
+        window.global::<SettingsBridge>().on_flash_start(move || {
+            let fw_path = flash_firmware_path.lock().unwrap().clone();
+            if fw_path.is_empty() { return; }
+
+            // Get selected port name from the bridge
+            let port_name = if let Some(w) = window_weak.upgrade() {
+                let bridge = w.global::<SettingsBridge>();
+                let idx = bridge.get_selected_prog_port() as usize;
+                let ports_model = bridge.get_prog_ports();
+                if idx < ports_model.row_count() {
+                    ports_model.row_data(idx).map(|s| s.to_string()).unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            if port_name.is_empty() {
+                let _ = tx.send(BgMsg::FlashProgress(0.0, "No port selected".into()));
+                return;
+            }
+
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let firmware = match std::fs::read(&fw_path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        let _ = tx.send(BgMsg::FlashProgress(0.0, format!("File read error: {}", e)));
+                        return;
+                    }
+                };
+
+                let (flash_tx, flash_rx) = mpsc::channel();
+                let port_name_clone = port_name.clone();
+                let flash_handle = std::thread::spawn(move || {
+                    logic::flasher::flash_firmware(&port_name_clone, &firmware, 0x10000, &flash_tx)
+                });
+
+                // Forward progress messages
+                while let Ok(logic::flasher::FlashProgress::OtaProgress(progress, msg)) = flash_rx.recv() {
+                    let _ = tx.send(BgMsg::FlashProgress(progress, msg));
+                }
+
+                match flash_handle.join() {
+                    Ok(Ok(())) => {
+                        let _ = tx.send(BgMsg::FlashProgress(1.0, "Flash complete!".into()));
+                    }
+                    Ok(Err(e)) => {
+                        let _ = tx.send(BgMsg::FlashProgress(0.0, format!("Flash error: {}", e)));
+                    }
+                    Err(_) => {
+                        let _ = tx.send(BgMsg::FlashProgress(0.0, "Flash thread panicked".into()));
+                    }
+                }
+            });
+        });
+    }
+
     // --- Poll background messages via timer ---
     {
         let window_weak = window.as_weak();
@@ -733,7 +1257,7 @@ fn main() {
 
                             // Update keymap
                             *current_keymap.borrow_mut() = km.clone();
-                            update_keycap_labels(&keycap_model, &keys_arc, &km, &keyboard_layout);
+                            update_keycap_labels(&keycap_model, &keys_arc, &km, &keyboard_layout.borrow());
                         }
                         BgMsg::ConnectError(e) => {
                             let app = window.global::<AppState>();
@@ -742,7 +1266,7 @@ fn main() {
                         }
                         BgMsg::Keymap(km) => {
                             *current_keymap.borrow_mut() = km.clone();
-                            update_keycap_labels(&keycap_model, &keys_arc, &km, &keyboard_layout);
+                            update_keycap_labels(&keycap_model, &keys_arc, &km, &keyboard_layout.borrow());
                             window.global::<AppState>().set_status_text("Keymap loaded".into());
                         }
                         BgMsg::LayerNames(names) => {
@@ -789,8 +1313,123 @@ fn main() {
                             let vec_model = Rc::new(VecModel::from(model));
                             window.global::<AdvancedBridge>().set_combos(ModelRc::from(vec_model));
                         }
+                        BgMsg::StatsData(heatmap_data, max_val) => {
+                            // Build heatmap keycaps: same positions as regular but
+                            // colored by press frequency
+                            let mut total: u32 = 0;
+                            for row in &heatmap_data {
+                                for &count in row {
+                                    total += count;
+                                }
+                            }
+
+                            let km = current_keymap.borrow();
+                            let heatmap_keycaps: Vec<KeycapData> = keys_arc
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, kp)| {
+                                    let row = kp.row as usize;
+                                    let col = kp.col as usize;
+                                    let count = heatmap_data
+                                        .get(row)
+                                        .and_then(|r| r.get(col))
+                                        .copied()
+                                        .unwrap_or(0);
+                                    let value = if max_val > 0 {
+                                        count as f32 / max_val as f32
+                                    } else {
+                                        0.0
+                                    };
+                                    let color = heatmap_color(value);
+
+                                    // Get key label from keymap
+                                    let code = km.get(row).and_then(|r| r.get(col)).copied().unwrap_or(0);
+                                    let decoded = keycode::decode_keycode(code);
+                                    let layout = keyboard_layout.borrow();
+                                    let remapped = logic::layout_remap::remap_key_label(&layout, &decoded);
+                                    let label = remapped.unwrap_or(&decoded).to_string();
+
+                                    KeycapData {
+                                        x: kp.x,
+                                        y: kp.y,
+                                        w: kp.w,
+                                        h: kp.h,
+                                        rotation: kp.angle,
+                                        rotation_cx: kp.w / 2.0,
+                                        rotation_cy: kp.h / 2.0,
+                                        label: SharedString::from(label),
+                                        sublabel: SharedString::from(format!("{}", count)),
+                                        keycode: code as i32,
+                                        color,
+                                        selected: false,
+                                        index: idx as i32,
+                                    }
+                                })
+                                .collect();
+
+                            let heatmap_model = Rc::new(VecModel::from(heatmap_keycaps));
+                            let stats_bridge = window.global::<StatsBridge>();
+                            stats_bridge.set_heatmap_keycaps(ModelRc::from(heatmap_model));
+                            stats_bridge.set_total_keypresses(total as i32);
+
+                            // Build stats summary using stats_analyzer
+                            let balance = logic::stats_analyzer::hand_balance(&heatmap_data);
+                            let fingers = logic::stats_analyzer::finger_load(&heatmap_data);
+                            let rows = logic::stats_analyzer::row_usage(&heatmap_data);
+                            let top = logic::stats_analyzer::top_keys(&heatmap_data, &km, 10);
+                            let dead = logic::stats_analyzer::dead_keys(&heatmap_data, &km);
+
+                            let mut summary = String::new();
+                            summary.push_str(&format!(
+                                "Hand Balance:  Left {:.1}% ({})  |  Right {:.1}% ({})\n\n",
+                                balance.left_pct, balance.left_count,
+                                balance.right_pct, balance.right_count
+                            ));
+
+                            summary.push_str("Finger Load:\n");
+                            for f in &fingers {
+                                if f.count > 0 {
+                                    summary.push_str(&format!("  {:>10}  {:5.1}%  ({})\n", f.name, f.pct, f.count));
+                                }
+                            }
+
+                            summary.push_str("\nRow Usage:\n");
+                            for r in &rows {
+                                summary.push_str(&format!("  {:>8}  {:5.1}%  ({})\n", r.name, r.pct, r.count));
+                            }
+
+                            if !top.is_empty() {
+                                summary.push_str("\nTop Keys:\n");
+                                for (i, k) in top.iter().enumerate() {
+                                    summary.push_str(&format!(
+                                        "  {:2}. {:>8} ({:>8})  {:5.1}%  ({})\n",
+                                        i + 1, k.name, k.finger, k.pct, k.count
+                                    ));
+                                }
+                            }
+
+                            if !dead.is_empty() {
+                                summary.push_str(&format!("\nDead Keys ({}): {}\n", dead.len(), dead.join(", ")));
+                            }
+
+                            stats_bridge.set_stats_summary(SharedString::from(summary));
+                            window.global::<AppState>().set_status_text("Stats loaded".into());
+                        }
                         BgMsg::StatusMsg(msg) => {
                             window.global::<AppState>().set_status_text(SharedString::from(msg));
+                        }
+                        BgMsg::OtaProgress(progress, status) => {
+                            let sb = window.global::<SettingsBridge>();
+                            sb.set_ota_progress(progress);
+                            sb.set_ota_status(SharedString::from(status));
+                            if progress >= 1.0 {
+                                sb.set_ota_in_progress(false);
+                            }
+                        }
+                        BgMsg::FlashProgress(progress, status) => {
+                            let sb = window.global::<SettingsBridge>();
+                            sb.set_flash_progress(progress);
+                            sb.set_flash_status(SharedString::from(status));
                         }
                     }
                 }

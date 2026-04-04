@@ -1,11 +1,52 @@
+import { Button, ScrollView } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
+import { StatsBridge } from "../globals.slint";
+import { KeyboardView } from "../components/keyboard_view.slint";
 
-export component TabStats inherits Rectangle {
-    background: Theme.bg-primary;
-    Text {
-        text: "Stats (coming soon)";
-        color: Theme.fg-secondary;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+export component TabStats inherits VerticalLayout {
+    padding: 12px;
+    spacing: 8px;
+
+    // Top bar: buttons + total keypresses
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+
+        Button {
+            text: "Refresh Stats";
+            clicked => { StatsBridge.refresh-stats(); }
+        }
+
+        Button {
+            text: "Export CSV";
+            clicked => { StatsBridge.export-csv(); }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        Text {
+            text: "Total keypresses: " + StatsBridge.total-keypresses;
+            color: Theme.accent-cyan;
+            vertical-alignment: center;
+        }
+    }
+
+    // Keyboard heatmap view (main area)
+    KeyboardView {
+        vertical-stretch: 1;
+        keycaps: StatsBridge.heatmap-keycaps;
+        key-clicked(idx) => { }
+    }
+
+    // Stats summary text
+    ScrollView {
+        height: 140px;
+
+        Text {
+            text: StatsBridge.stats-summary;
+            color: Theme.fg-primary;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
     }
 }

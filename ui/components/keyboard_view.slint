@@ -1,20 +1,23 @@
 import { Theme } from "../theme.slint";
-import { KeymapBridge, KeycapData } from "../globals.slint";
+import { KeycapData } from "../globals.slint";
 import { KeyButton } from "key_button.slint";
 
 export component KeyboardView inherits Rectangle {
+    in property <[KeycapData]> keycaps;
+    callback key-clicked(int);
+
     background: Theme.bg-surface;
     border-radius: 8px;
     min-height: 250px;
     clip: true;
 
     // Each keycap is positioned absolutely
-    for keycap[idx] in KeymapBridge.keycaps : KeyButton {
+    for keycap[idx] in root.keycaps : KeyButton {
         x: keycap.x;
         y: keycap.y;
         data: keycap;
         clicked(key-index) => {
-            KeymapBridge.select-key(key-index);
+            root.key-clicked(key-index);
         }
     }
 }

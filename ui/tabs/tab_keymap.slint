@@ -63,6 +63,10 @@ export component TabKeymap inherits VerticalLayout {
     // Keyboard view (main area)
     KeyboardView {
         vertical-stretch: 1;
+        keycaps: KeymapBridge.keycaps;
+        key-clicked(idx) => {
+            KeymapBridge.select-key(idx);
+        }
     }
 
     // Selected key info bar

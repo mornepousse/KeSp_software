@@ -89,6 +89,15 @@ export global KeySelectorBridge {
     callback search-changed(string);
 }
 
+export global StatsBridge {
+    in property <[KeycapData]> heatmap-keycaps;
+    in-out property <bool> heatmap-active: false;
+    in property <string> stats-summary: "";
+    in property <int> total-keypresses: 0;
+    callback refresh-stats();
+    callback export-csv();
+}
+
 export struct TapDanceSlot {
     index: int,
     tap1: string,
@@ -124,4 +133,32 @@ export global AdvancedBridge {
     callback refresh-all();
     callback save-td(int);
     callback delete-combo(int);
+}
+
+export global SettingsBridge {
+    // Layout
+    in property <[string]> available-layouts;
+    in-out property <int> selected-layout-index: 0;
+    callback change-layout(int);
+
+    // Backup / Restore
+    callback backup();
+    callback restore();
+
+    // OTA
+    in-out property <float> ota-progress: 0;
+    in-out property <string> ota-status: "";
+    in-out property <bool> ota-in-progress: false;
+    in-out property <string> ota-file-name: "";
+    callback ota-select-file();
+    callback ota-start();
+
+    // DFU / Flasher
+    in property <[string]> prog-ports;
+    in-out property <int> selected-prog-port: 0;
+    in-out property <string> prog-path: "";
+    in-out property <float> flash-progress: 0;
+    in-out property <string> flash-status: "";
+    callback flash-select-file();
+    callback flash-start();
 }
